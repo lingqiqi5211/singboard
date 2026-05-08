@@ -1,0 +1,179 @@
+name: Build And Upload To Telegram
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.channel }}
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: portable
+            build_args: --no-bundle
+          - channel: nsis
+            build_args: --bundles nsis
+          - channel: msi
+            build_args: --bundles msi
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> src-tauri/target
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install WiX Toolset
+        if: matrix.channel == 'msi'
+        run: choco install wixtoolset -y
+
+      - name: Build Tauri app
+        run: pnpm tauri build ${{ matrix.build_args }}
+
+      - name: Collect channel files
+        shell: pwsh
+        run: |
+          $channel = "${{ matrix.channel }}"
+          $outDir = Join-Path $PWD "out"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+
+          switch ($channel) {
+            "portable" {
+              $files = @(Get-ChildItem -Path "src-tauri/target/release" -File | Where-Object {
+                $_.Name -ieq "singboard.exe"
+              })
+              break
+            }
+            "nsis" {
+              $files = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension.ToLowerInvariant() -eq ".exe"
+              })
+              break
+            }
+            "msi" {
+              $files = @(Get-ChildItem -Path "src-tauri/target/release/bundle/msi" -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+                $_.Extension.ToLowerInvariant() -eq ".msi"
+              })
+              break
+            }
+            default {
+              throw "Unsupported channel: $channel"
+            }
+          }
+
+          if ($files.Count -eq 0) {
+            throw "No files found for channel: $channel"
+          }
+
+          foreach ($file in $files) {
+            Copy-Item -Path $file.FullName -Destination $outDir -Force
+          }
+
+      - name: Upload channel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: singboard-${{ matrix.channel }}-${{ github.run_number }}
+          if-no-files-found: error
+          path: out/*
+
+  telegram:
+    name: Upload To Telegram
+    runs-on: windows-latest
+    needs: build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download all channel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: telegram-artifacts
+          pattern: singboard-*-${{ github.run_number }}
+          merge-multiple: true
+
+      - name: Validate Telegram secrets
+        shell: pwsh
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_BOT_TOKEN)) {
+            throw "Missing secret: TELEGRAM_BOT_TOKEN"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TELEGRAM_CHAT_ID)) {
+            throw "Missing secret: TELEGRAM_CHAT_ID"
+          }
+
+      - name: Upload artifacts to Telegram group
+        shell: pwsh
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          $files = @(Get-ChildItem -Path "telegram-artifacts" -Recurse -File | Sort-Object FullName)
+
+          if ($files.Count -eq 0) {
+            throw "No artifact files found to upload"
+          }
+
+          $repo = "${{ github.repository }}"
+          $ref = "${{ github.ref_name }}"
+          $sha = "${{ github.sha }}"
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          for ($i = 0; $i -lt $files.Count; $i++) {
+            $file = $files[$i]
+            $name = $file.Name
+
+            if ($i -eq ($files.Count - 1)) {
+              $tempFile = Join-Path $env:RUNNER_TEMP ("tg-" + [guid]::NewGuid().ToString() + "-" + $name)
+              Copy-Item -Path $file.FullName -Destination $tempFile -Force
+
+              $footer = "`r`n-----BUILD-INFO-----`r`nrepo=$repo`r`nref=$ref`r`nsha=$sha`r`nrun=$runUrl`r`nbuild_time_utc=$buildTime`r`n-----END-BUILD-INFO-----`r`n"
+              $footerBytes = [System.Text.Encoding]::UTF8.GetBytes($footer)
+              $stream = [System.IO.File]::Open($tempFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+              try {
+                $stream.Write($footerBytes, 0, $footerBytes.Length)
+              }
+              finally {
+                $stream.Dispose()
+              }
+
+              curl.exe --fail --silent --show-error -X POST "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendDocument" -F "chat_id=$env:TELEGRAM_CHAT_ID" -F "document=@$tempFile;filename=$name" | Out-Null
+            }
+            else {
+              curl.exe --fail --silent --show-error -X POST "https://api.telegram.org/bot$env:TELEGRAM_BOT_TOKEN/sendDocument" -F "chat_id=$env:TELEGRAM_CHAT_ID" -F "document=@$($file.FullName);filename=$name" | Out-Null
+            }
+          }
