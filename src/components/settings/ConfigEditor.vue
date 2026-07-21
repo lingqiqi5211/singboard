@@ -414,6 +414,15 @@ function recomputeDirtyState() {
 
 const moduleRawContents = ref<Record<string, string>>({})
 
+function buildModuleRawContents(source: string, config: Record<string, unknown>) {
+  const contents: Record<string, string> = {}
+  for (const key of Object.keys(config)) {
+    const text = extractJsoncValueText(source, key)
+    if (text !== null) contents[key] = text
+  }
+  return contents
+}
+
 function renderModuleContent(keepChangeState = false) {
   if (!fullConfigObject.value) return
   const key = activeModule.value
@@ -439,15 +448,9 @@ function switchMode(mode: 'whole' | 'module') {
   if (mode === 'module') {
     if (!fullConfigObject.value && !ensureStructuredConfigFromEditor()) return
     wholeRawContent.value = getEditorContent()
-    const raw = wholeRawContent.value
-    const rawMap: Record<string, string> = {}
-    if (fullConfigObject.value) {
-      for (const key of Object.keys(fullConfigObject.value)) {
-        const text = extractJsoncValueText(raw, key)
-        if (text !== null) rawMap[key] = text
-      }
-    }
-    moduleRawContents.value = rawMap
+    moduleRawContents.value = fullConfigObject.value
+      ? buildModuleRawContents(wholeRawContent.value, fullConfigObject.value)
+      : {}
     if (!moduleItems.value.some((item) => item.key === activeModule.value)) {
       activeModule.value = moduleItems.value[0]?.key ?? 'log'
     }
@@ -501,6 +504,9 @@ async function loadConfig() {
   loading.value = true
   try {
     const content = await readSingboxConfig(props.configPath)
+    editorMode.value = 'whole'
+    activeModule.value = 'log'
+    moduleRawContents.value = {}
     savedRawContent.value = content
     wholeRawContent.value = content
     setEditorContent(content)
@@ -559,6 +565,10 @@ async function handleSave() {
       const content = JSON.stringify(fullConfigObject.value ?? {}, null, 2)
       await writeSingboxConfig(props.configPath, content)
       wholeRawContent.value = content
+      moduleRawContents.value = buildModuleRawContents(
+        content,
+        fullConfigObject.value ?? {},
+      )
       const normalized = normalizeRootObject(fullConfigObject.value)
       if (normalized) {
         savedFullNormalized.value = normalized
