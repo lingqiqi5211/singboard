@@ -4,6 +4,7 @@ import { useConnectionsStore } from '@/stores/connections'
 import { formatBytes, formatSpeed, formatDuration } from '@/utils/format'
 import { getGeoIPForIP, type IPGeoInfo } from '@/api/geoip'
 import type { Connection } from '@/types'
+import AppIcon from '@/components/common/AppIcon.vue'
 
 const {
   filteredConnections,
@@ -231,13 +232,13 @@ onMounted(() => {
                   @click.stop="closeConnection(conn.id)"
                   title="断开"
                 >
-                  ✕
+                  <AppIcon name="close" class="w-3.5 h-3.5" />
                 </button>
               </td>
             </tr>
           </tbody>
         </table>
-  
+
         <div
           v-if="filteredConnections.length === 0"
           class="flex items-center justify-center py-10 text-base-content/40"
@@ -291,7 +292,7 @@ onMounted(() => {
             </tr>
           </tbody>
         </table>
-  
+
         <div
           v-if="filteredClosedConnections.length === 0"
           class="flex items-center justify-center py-10 text-base-content/40"
@@ -312,7 +313,7 @@ onMounted(() => {
       <div class="glass-popover w-full max-w-2xl max-h-[80vh] flex flex-col rounded-[var(--radius-panel)]">
         <div class="flex items-center justify-between px-5 pt-4 pb-3 shrink-0">
           <h3 class="font-bold text-lg">连接详情</h3>
-          <button class="btn btn-sm btn-circle btn-ghost" @click="closeDetail">✕</button>
+          <button class="btn btn-sm btn-circle btn-ghost" aria-label="关闭" @click="closeDetail"><AppIcon name="close" class="w-4 h-4" /></button>
         </div>
 
         <div class="flex-1 min-h-0 overflow-y-auto px-5 space-y-4">

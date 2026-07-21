@@ -12,6 +12,7 @@ import { useProxiesStore } from '@/stores/proxies'
 import { srsMatchProvider, srsListProvider, getRunningConfigPath } from '@/bridge/config'
 import { formatDate } from '@/utils/format'
 import { batchUpdateProviders } from '@/utils/batchUpdate'
+import AppIcon from '@/components/common/AppIcon.vue'
 
 const { filteredRules, loading, filterText, loadRules } = useRulesStore()
 const { serviceStatus } = useServiceStore()
@@ -530,11 +531,11 @@ watch(isRunning, (running) => {
               </tr>
             </tbody>
           </table>
-  
+
           <div v-if="loading" class="rules-empty" aria-label="正在加载规则">
             <span class="loading loading-spinner loading-md"></span>
           </div>
-  
+
           <div
             v-else-if="filteredRules.length === 0"
             class="rules-empty"
@@ -635,14 +636,14 @@ watch(isRunning, (running) => {
               </tr>
             </tbody>
           </table>
-  
+
           <div
             v-if="ruleProviders.length === 0"
             class="rules-empty"
           >
             暂无规则提供商
           </div>
-  
+
           <div
             v-else-if="providerSearchText.trim() && providerSearchDone && displayedProviders.length === 0"
             class="rules-empty"
@@ -675,7 +676,9 @@ watch(isRunning, (running) => {
             <span class="text-xs text-base-content/40">{{ formatDate(detailProvider.updatedAt) }}</span>
           </div>
         </div>
-        <button class="btn btn-sm btn-circle btn-ghost" aria-label="关闭规则详情" @click="closeProviderDetail">✕</button>
+        <button class="btn btn-sm btn-circle btn-ghost" aria-label="关闭规则详情" @click="closeProviderDetail">
+          <AppIcon name="close" class="w-4 h-4" />
+        </button>
       </div>
 
       <div class="px-5 pb-2 shrink-0 flex items-center gap-2">
