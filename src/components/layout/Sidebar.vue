@@ -7,6 +7,7 @@ import { useToastStore } from '@/stores/toast'
 import { stopService } from '@/bridge/service'
 import { startCore } from '@/utils/coreControl'
 import { formatUptime } from '@/utils/format'
+import AppIcon from '@/components/common/AppIcon.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,7 +23,7 @@ const navItems = [
   { path: '/rules', label: '规则', icon: 'rule' },
   { path: '/config', label: '配置', icon: 'config' },
   { path: '/settings', label: '设置', icon: 'settings' },
-]
+] as const
 
 const currentPath = computed(() => route.path)
 
@@ -87,15 +88,7 @@ const statusPillClass = computed(() => {
         "
         @click="navigate(item.path)"
       >
-        <span class="w-5 text-center emoji-font">
-          <template v-if="item.icon === 'chart'">📊</template>
-          <template v-else-if="item.icon === 'proxy'">🔀</template>
-          <template v-else-if="item.icon === 'connection'">🔗</template>
-          <template v-else-if="item.icon === 'log'">📝</template>
-          <template v-else-if="item.icon === 'rule'">📋</template>
-          <template v-else-if="item.icon === 'config'">📄</template>
-          <template v-else-if="item.icon === 'settings'">⚙️</template>
-        </span>
+        <AppIcon :name="item.icon" class="w-5 h-5" />
         <span>{{ item.label }}</span>
       </button>
     </nav>

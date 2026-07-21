@@ -12,6 +12,7 @@ import { useProxiesStore } from '@/stores/proxies'
 import { srsMatchProvider, srsListProvider, getRunningConfigPath } from '@/bridge/config'
 import { formatDate } from '@/utils/format'
 import { batchUpdateProviders } from '@/utils/batchUpdate'
+import AppIcon from '@/components/common/AppIcon.vue'
 
 const { filteredRules, loading, filterText, loadRules } = useRulesStore()
 const { serviceStatus } = useServiceStore()
@@ -650,7 +651,9 @@ watch(isRunning, (running) => {
             <span class="text-xs text-base-content/40">{{ formatDate(detailProvider.updatedAt) }}</span>
           </div>
         </div>
-        <button class="btn btn-sm btn-circle btn-ghost" @click="closeProviderDetail">✕</button>
+        <button class="btn btn-sm btn-circle btn-ghost" title="关闭" @click="closeProviderDetail">
+          <AppIcon name="close" class="w-4 h-4" />
+        </button>
       </div>
 
       <div class="px-5 pb-2 shrink-0 flex items-center gap-2">

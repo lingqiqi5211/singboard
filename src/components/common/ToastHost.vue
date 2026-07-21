@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useToastStore } from '@/stores/toast'
+import AppIcon from '@/components/common/AppIcon.vue'
 
 const { toasts, removeToast, pauseToast, resumeToast } = useToastStore()
 
@@ -22,9 +23,11 @@ function toastClass(type?: 'error' | 'info') {
       @mouseleave="resumeToast(toast.id)"
     >
       <div class="flex items-start gap-2">
-        <span class="text-sm leading-none mt-0.5">◔</span>
+        <AppIcon :name="toast.type === 'info' ? 'info' : 'error'" class="w-4 h-4 mt-0.5" />
         <p class="text-sm leading-snug whitespace-pre-line flex-1">{{ toast.message }}</p>
-        <button class="text-sm leading-none opacity-80 hover:opacity-100" @click="removeToast(toast.id)">×</button>
+        <button class="opacity-80 hover:opacity-100" title="关闭" @click="removeToast(toast.id)">
+          <AppIcon name="close" class="w-3.5 h-3.5" />
+        </button>
       </div>
       <div class="mt-2 h-1 rounded-full bg-white/30 overflow-hidden">
         <div

@@ -4,6 +4,7 @@ import { useConnectionsStore } from '@/stores/connections'
 import { formatBytes, formatSpeed, formatDuration } from '@/utils/format'
 import { getGeoIPForIP, type IPGeoInfo } from '@/api/geoip'
 import type { Connection } from '@/types'
+import AppIcon from '@/components/common/AppIcon.vue'
 
 const {
   filteredConnections,
@@ -230,7 +231,7 @@ onMounted(() => {
                 @click.stop="closeConnection(conn.id)"
                 title="断开"
               >
-                ✕
+                <AppIcon name="close" class="w-3.5 h-3.5" />
               </button>
             </td>
           </tr>
@@ -302,7 +303,9 @@ onMounted(() => {
       <div v-if="selectedConnection" class="modal-box max-w-2xl">
         <div class="flex items-center justify-between mb-4">
           <h3 class="font-bold text-lg">连接详情</h3>
-          <button class="btn btn-sm btn-circle btn-ghost" @click="closeDetail">✕</button>
+          <button class="btn btn-sm btn-circle btn-ghost" title="关闭" @click="closeDetail">
+            <AppIcon name="close" class="w-4 h-4" />
+          </button>
         </div>
 
         <div class="space-y-4">
