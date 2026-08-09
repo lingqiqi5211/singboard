@@ -4,7 +4,14 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { useConfigStore } from '@/stores/config'
 import { useSingboxVersionStore } from '@/stores/singboxVersion'
 import { useToastStore } from '@/stores/toast'
-import { checkCoreUpdate, performCoreUpdate, probeAssetExeHash, type CoreUpdateInfo, type CoreUpdateProgress } from '@/bridge/coreUpdate'
+import {
+  checkCoreUpdate,
+  performCoreUpdate,
+  probeAssetExeHash,
+  type CoreAssetFormat,
+  type CoreUpdateInfo,
+  type CoreUpdateProgress,
+} from '@/bridge/coreUpdate'
 import { getFileHash } from '@/bridge/config'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 
@@ -38,6 +45,7 @@ const { pushToast } = useToastStore()
 const REPOS: Record<string, string> = {
   official: 'SagerNet/sing-box',
   ref1nd: 'reF1nd/sing-box-releases',
+  lingqiqi: 'lingqiqi5211/sing-box-p',
 }
 
 const dialogRef = ref<InstanceType<typeof ConfirmDialog> | null>(null)
@@ -52,6 +60,13 @@ const repo = computed(() =>
   config.value.coreUpdateSource === 'custom'
     ? config.value.coreUpdateCustomRepo.trim()
     : REPOS[config.value.coreUpdateSource],
+)
+const isLingqiqiSource = computed(() => config.value.coreUpdateSource === 'lingqiqi')
+const releaseChannel = computed(() =>
+  isLingqiqiSource.value ? 'latest' : config.value.coreUpdateChannel,
+)
+const assetFormat = computed<CoreAssetFormat>(() =>
+  isLingqiqiSource.value ? 'exe' : 'zip',
 )
 
 const latestDisplay = computed(() => latest.value?.version.replace(/^v/, '') ?? '')
@@ -95,7 +110,7 @@ const phaseText = computed(() => {
 })
 
 // 版本号相同时判断本地核心与上游最新资产是否不一致（上游重建或本地被手动替换）。
-// 缓存命中直接比对；未命中则下载资产解压计算 exe 哈希（每个 digest 只下载一次）
+// 缓存命中直接比对；未命中则下载并准备资产后计算 exe 哈希（每个 digest 只下载一次）
 async function isLocalOutOfSync(info: CoreUpdateInfo): Promise<boolean> {
   const path = config.value.singboxPath.trim()
   // 源未提供资产 digest 时无法缓存校验结果，跳过检测避免每次检查都下载
@@ -115,6 +130,7 @@ async function isLocalOutOfSync(info: CoreUpdateInfo): Promise<boolean> {
     const exeHash = await probeAssetExeHash({
       assetUrl: info.assetUrl,
       assetSize: info.assetSize,
+      assetFormat: info.assetFormat,
       mirror: config.value.coreUpdateMirror,
     })
     saveInstallRecord({ assetDigest: info.assetDigest, exeHash })
@@ -135,7 +151,7 @@ async function handleCheck() {
   try {
     // 核心文件可能在面板运行期间被替换过，先重新检测当前版本再比较
     const [info] = await Promise.all([
-      checkCoreUpdate(repo.value, config.value.coreUpdateChannel),
+      checkCoreUpdate(repo.value, releaseChannel.value, assetFormat.value),
       detectVersion(),
     ])
     const checkedVersion = info.version.replace(/^v/, '')
@@ -147,7 +163,9 @@ async function handleCheck() {
       pushToast({ message: `当前已是最新版本（${checkedVersion}）`, type: 'info' })
       return
     }
-    const channelLabel = config.value.coreUpdateChannel === 'testing' ? '测试版' : '稳定版'
+    const channelLabel = isLingqiqiSource.value
+      ? '最新发布'
+      : (config.value.coreUpdateChannel === 'testing' ? '测试版' : '稳定版')
     const publishedAt = latest.value.publishedAt
       ? new Date(latest.value.publishedAt).toLocaleString()
       : '未知'
@@ -183,6 +201,7 @@ async function handleUpdate() {
     const result = await performCoreUpdate({
       assetUrl: latest.value.assetUrl,
       assetSize: latest.value.assetSize,
+      assetFormat: latest.value.assetFormat,
       mirror: config.value.coreUpdateMirror,
       singboxPath: config.value.singboxPath,
       serviceName: config.value.serviceName,
@@ -246,16 +265,21 @@ onUnmounted(() => {
         <select v-model="config.coreUpdateSource" class="select select-sm select-bordered">
           <option value="official">官方核心 (SagerNet/sing-box)</option>
           <option value="ref1nd">reF1nd 核心</option>
+          <option value="lingqiqi">sing-box-p 核心</option>
           <option value="custom">自定义仓库</option>
         </select>
         </label>
-        <label class="settings-field">
+        <label v-if="!isLingqiqiSource" class="settings-field">
           <span>版本通道</span>
         <select v-model="config.coreUpdateChannel" class="select select-sm select-bordered">
           <option value="stable">稳定版</option>
           <option value="testing">测试版</option>
         </select>
         </label>
+      </div>
+
+      <div v-if="isLingqiqiSource" class="text-xs text-base-content/60">
+        自动跟踪最新发布，不区分稳定版和测试版
       </div>
 
       <label v-if="config.coreUpdateSource === 'custom'" class="settings-field">
@@ -286,7 +310,7 @@ onUnmounted(() => {
           <span v-else-if="outOfSync" class="badge badge-warning badge-sm">与上游不一致</span>
           <span v-else-if="latest">已是最新版本 <strong class="settings-mono">{{ latestDisplay }}</strong></span>
           <span v-else>尚未检查上游版本</span>
-          <span v-if="latest?.prerelease" class="badge badge-warning badge-xs">预发布</span>
+          <span v-if="latest?.prerelease && !isLingqiqiSource" class="badge badge-warning badge-xs">预发布</span>
         </div>
         <button
           type="button"

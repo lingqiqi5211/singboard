@@ -13,8 +13,21 @@ pub(crate) static UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::cons
 pub(crate) const CORE_PROGRESS_EVENT: &str = "core-update-progress";
 
 const CORE_EXE_NAME: &str = "sing-box.exe";
-/// 一致性校验阶段解压结果的清单，供随后的安装复用（同一资产不下载两次）
+/// 一致性校验阶段准备结果的清单，供随后的安装复用（同一资产不下载两次）
 const STAGED_MANIFEST: &str = "staged.json";
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreAssetFormat {
+    Zip,
+    Exe,
+}
+
+impl Default for CoreAssetFormat {
+    fn default() -> Self {
+        Self::Zip
+    }
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +40,7 @@ pub struct CoreUpdateInfo {
     asset_size: u64,
     /// GitHub 资产的 SHA-256（形如 "sha256:..."），个别源可能缺失则为空串
     asset_digest: String,
+    asset_format: CoreAssetFormat,
 }
 
 #[derive(Serialize)]
@@ -49,6 +63,8 @@ pub(crate) struct UpdateProgress {
 struct StagedCore {
     asset_url: String,
     asset_size: u64,
+    #[serde(default)]
+    asset_format: CoreAssetFormat,
     exe_hash: String,
     dlls: Vec<String>,
 }
@@ -88,26 +104,39 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     }
 }
 
-fn windows_arch_suffix() -> Result<String, String> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("windows-amd64.zip".into()),
-        "aarch64" => Ok("windows-arm64.zip".into()),
-        other => Err(format!("不支持的 CPU 架构: {}", other)),
+fn windows_asset_pattern(
+    asset_format: CoreAssetFormat,
+    arch: &str,
+) -> Result<&'static str, String> {
+    match (asset_format, arch) {
+        (CoreAssetFormat::Zip, "x86_64") => Ok("windows-amd64.zip"),
+        (CoreAssetFormat::Zip, "aarch64") => Ok("windows-arm64.zip"),
+        (CoreAssetFormat::Exe, "x86_64") => Ok("sing-box_windows_amd64.exe"),
+        (CoreAssetFormat::Exe, "aarch64") => Ok("sing-box_windows_arm64.exe"),
+        (_, other) => Err(format!("不支持的 CPU 架构: {}", other)),
     }
 }
 
-/// 下载与解压产物放在 %TEMP%\singboard（整个目录由核心更新独占，会被清空重建）。
-/// 校验与安装共用它，安装才能复用校验解压出来的文件
+/// 下载与准备产物放在 %TEMP%\singboard（整个目录由核心更新独占，会被清空重建）。
+/// 校验与安装共用它，安装才能复用校验准备好的文件
 fn staging_dir() -> PathBuf {
     std::env::temp_dir().join("singboard")
 }
 
-/// 暂存目录里的解压结果能否直接安装：清单指向同一资产，exe 与随附 dll 都在，
+/// 暂存目录里的准备结果能否直接安装：清单指向同一资产，exe 与随附 dll 都在，
 /// 且 exe 哈希与清单一致（残留被改动或上次写坏时退回重新下载）
-fn take_staged(staging: &Path, asset_url: &str, asset_size: u64) -> Option<Vec<String>> {
+fn take_staged(
+    staging: &Path,
+    asset_url: &str,
+    asset_size: u64,
+    asset_format: CoreAssetFormat,
+) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(staging.join(STAGED_MANIFEST)).ok()?;
     let staged: StagedCore = serde_json::from_str(&text).ok()?;
-    if staged.asset_url != asset_url || staged.asset_size != asset_size {
+    if staged.asset_url != asset_url
+        || staged.asset_size != asset_size
+        || staged.asset_format != asset_format
+    {
         return None;
     }
     if crate::service::helper::sha256_file(&staging.join(CORE_EXE_NAME)).ok()? != staged.exe_hash {
@@ -172,12 +201,25 @@ pub(crate) async fn github_get(url: &str) -> Result<reqwest::Response, String> {
     Ok(resp)
 }
 
-fn pick_windows_asset(release: &GhRelease, suffix: &str) -> Result<CoreUpdateInfo, String> {
+fn pick_windows_asset(
+    release: &GhRelease,
+    pattern: &str,
+    asset_format: CoreAssetFormat,
+) -> Result<CoreUpdateInfo, String> {
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name.ends_with(suffix))
-        .ok_or_else(|| format!("该版本未提供适用于 {} 的资产", suffix.trim_end_matches(".zip")))?;
+        .find(|a| match asset_format {
+            CoreAssetFormat::Zip => a.name.ends_with(pattern),
+            CoreAssetFormat::Exe => a.name == pattern,
+        })
+        .ok_or_else(|| match asset_format {
+            CoreAssetFormat::Zip => format!(
+                "该版本未提供适用于 {} 的资产",
+                pattern.trim_end_matches(".zip")
+            ),
+            CoreAssetFormat::Exe => format!("该版本未提供资产 {}", pattern),
+        })?;
     Ok(CoreUpdateInfo {
         version: release.tag_name.clone(),
         prerelease: release.prerelease,
@@ -186,26 +228,40 @@ fn pick_windows_asset(release: &GhRelease, suffix: &str) -> Result<CoreUpdateInf
         asset_url: asset.browser_download_url.clone(),
         asset_size: asset.size,
         asset_digest: asset.digest.clone().unwrap_or_default(),
+        asset_format,
     })
 }
 
+fn latest_non_draft(releases: Vec<GhRelease>) -> Result<GhRelease, String> {
+    releases
+        .into_iter()
+        .find(|release| !release.draft)
+        .ok_or_else(|| "该仓库暂无发布版本".to_string())
+}
+
 #[tauri::command]
-pub async fn check_core_update(repo: String, channel: String) -> Result<CoreUpdateInfo, String> {
+pub async fn check_core_update(
+    repo: String,
+    channel: String,
+    asset_format: Option<CoreAssetFormat>,
+) -> Result<CoreUpdateInfo, String> {
     let repo = repo.trim().to_string();
     validate_repo(&repo)?;
-    let suffix = windows_arch_suffix()?;
+    let asset_format = asset_format.unwrap_or_default();
+    let pattern = windows_asset_pattern(asset_format, std::env::consts::ARCH)?;
 
-    let release = if channel == "testing" {
-        let url = format!("https://api.github.com/repos/{}/releases?per_page=10", repo);
+    let release = if channel == "testing" || channel == "latest" {
+        let per_page = if channel == "latest" { 100 } else { 10 };
+        let url = format!(
+            "https://api.github.com/repos/{}/releases?per_page={}",
+            repo, per_page
+        );
         let releases: Vec<GhRelease> = github_get(&url)
             .await?
             .json()
             .await
             .map_err(|e| format!("解析 GitHub API 响应失败: {}", e))?;
-        releases
-            .into_iter()
-            .find(|r| !r.draft)
-            .ok_or("该仓库暂无发布版本")?
+        latest_non_draft(releases)?
     } else {
         let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
         github_get(&url)
@@ -215,7 +271,7 @@ pub async fn check_core_update(repo: String, channel: String) -> Result<CoreUpda
             .map_err(|e| format!("解析 GitHub API 响应失败: {}", e))?
     };
 
-    pick_windows_asset(&release, &suffix)
+    pick_windows_asset(&release, pattern, asset_format)
 }
 
 pub(crate) async fn download_asset(
@@ -313,6 +369,25 @@ fn extract_core_files(zip_path: &Path, staging: &Path) -> Result<Vec<String>, St
         return Err(format!("压缩包内未找到 {}", CORE_EXE_NAME));
     }
     Ok(dlls)
+}
+
+fn downloaded_asset_path(staging: &Path, asset_format: CoreAssetFormat) -> PathBuf {
+    match asset_format {
+        CoreAssetFormat::Zip => staging.join("core.zip"),
+        CoreAssetFormat::Exe => staging.join(CORE_EXE_NAME),
+    }
+}
+
+fn prepare_core_files(
+    downloaded_path: &Path,
+    staging: &Path,
+    asset_format: CoreAssetFormat,
+) -> Result<Vec<String>, String> {
+    match asset_format {
+        CoreAssetFormat::Zip => extract_core_files(downloaded_path, staging),
+        CoreAssetFormat::Exe if downloaded_path.is_file() => Ok(Vec::new()),
+        CoreAssetFormat::Exe => Err(format!("下载的资产中未找到 {}", CORE_EXE_NAME)),
+    }
 }
 
 /// 对下载的核心跑一次 `version`，确认能运行并取版本串
@@ -464,6 +539,7 @@ pub async fn probe_asset_exe_hash(
     app: tauri::AppHandle,
     asset_url: String,
     asset_size: u64,
+    asset_format: Option<CoreAssetFormat>,
     mirror: Option<String>,
 ) -> Result<String, String> {
     let _guard = UPDATE_LOCK
@@ -478,24 +554,36 @@ pub async fn probe_asset_exe_hash(
         msg
     };
 
+    let asset_format = asset_format.unwrap_or_default();
     let download_url = apply_mirror(&mirror, &asset_url);
-    let zip_path = staging.join("core.zip");
-    download_asset(&app, CORE_PROGRESS_EVENT, &download_url, asset_size, &zip_path)
-        .await
-        .map_err(cleanup)?;
+    let downloaded_path = downloaded_asset_path(&staging, asset_format);
+    download_asset(
+        &app,
+        CORE_PROGRESS_EVENT,
+        &download_url,
+        asset_size,
+        &downloaded_path,
+    )
+    .await
+    .map_err(cleanup)?;
 
-    emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
-    // 解压结果与清单留在 staging：用户确认重新安装时直接取用，不再下载一遍
+    if asset_format == CoreAssetFormat::Zip {
+        emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
+    }
+    // 准备结果与清单留在 staging：用户确认重新安装时直接取用，不再下载一遍
     let hash = {
         let staging = staging.clone();
         let asset_url = asset_url.clone();
         tokio::task::spawn_blocking(move || {
-            let dlls = extract_core_files(&zip_path, &staging)?;
+            let dlls = prepare_core_files(&downloaded_path, &staging, asset_format)?;
             let exe_hash = crate::service::helper::sha256_file(&staging.join(CORE_EXE_NAME))?;
-            let _ = std::fs::remove_file(&zip_path);
+            if asset_format == CoreAssetFormat::Zip {
+                let _ = std::fs::remove_file(&downloaded_path);
+            }
             let manifest = serde_json::to_string(&StagedCore {
                 asset_url,
                 asset_size,
+                asset_format,
                 exe_hash: exe_hash.clone(),
                 dlls,
             })
@@ -518,6 +606,7 @@ pub async fn perform_core_update(
     app: tauri::AppHandle,
     asset_url: String,
     asset_size: u64,
+    asset_format: Option<CoreAssetFormat>,
     mirror: Option<String>,
     singbox_path: String,
     service_name: String,
@@ -535,6 +624,8 @@ pub async fn perform_core_update(
         return Err("sing-box 路径所在目录不存在".into());
     }
 
+    let asset_format = asset_format.unwrap_or_default();
+
     // 临时目录
     let staging = staging_dir();
     let cleanup = |msg: String| {
@@ -542,14 +633,16 @@ pub async fn perform_core_update(
         msg
     };
 
-    // 步骤 1-2：一致性校验刚下过同一个资产就直接复用其解压结果，否则下载并解压
+    // 步骤 1-2：一致性校验刚下过同一个资产就直接复用，否则下载并准备资产
     let staged_exe = staging.join(CORE_EXE_NAME);
     let reusable = {
         let staging = staging.clone();
         let asset_url = asset_url.clone();
-        tokio::task::spawn_blocking(move || take_staged(&staging, &asset_url, asset_size))
-            .await
-            .map_err(|e| format!("任务执行失败: {}", e))?
+        tokio::task::spawn_blocking(move || {
+            take_staged(&staging, &asset_url, asset_size, asset_format)
+        })
+        .await
+        .map_err(|e| format!("任务执行失败: {}", e))?
     };
     let dlls = match reusable {
         Some(dlls) => dlls,
@@ -558,18 +651,28 @@ pub async fn perform_core_update(
             std::fs::create_dir_all(&staging).map_err(|e| format!("创建临时目录失败: {}", e))?;
 
             let download_url = apply_mirror(&mirror, &asset_url);
-            let zip_path = staging.join("core.zip");
-            download_asset(&app, CORE_PROGRESS_EVENT, &download_url, asset_size, &zip_path)
-                .await
-                .map_err(cleanup)?;
+            let downloaded_path = downloaded_asset_path(&staging, asset_format);
+            download_asset(
+                &app,
+                CORE_PROGRESS_EVENT,
+                &download_url,
+                asset_size,
+                &downloaded_path,
+            )
+            .await
+            .map_err(cleanup)?;
 
-            emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
+            if asset_format == CoreAssetFormat::Zip {
+                emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
+            }
             let staging = staging.clone();
-            tokio::task::spawn_blocking(move || extract_core_files(&zip_path, &staging))
-                .await
-                .map_err(|e| format!("任务执行失败: {}", e))
-                .and_then(|r| r)
-                .map_err(cleanup)?
+            tokio::task::spawn_blocking(move || {
+                prepare_core_files(&downloaded_path, &staging, asset_format)
+            })
+            .await
+            .map_err(|e| format!("任务执行失败: {}", e))
+            .and_then(|r| r)
+            .map_err(cleanup)?
         }
     };
 
@@ -595,4 +698,72 @@ pub async fn perform_core_update(
     let _ = std::fs::remove_dir_all(&staging);
 
     Ok(CoreUpdateResult { version, restarted })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(name: &str) -> GhAsset {
+        GhAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.com/{name}"),
+            size: 1,
+            digest: None,
+        }
+    }
+
+    fn release(tag: &str, draft: bool, assets: Vec<GhAsset>) -> GhRelease {
+        GhRelease {
+            tag_name: tag.to_string(),
+            prerelease: false,
+            draft,
+            published_at: None,
+            assets,
+        }
+    }
+
+    #[test]
+    fn matches_zip_suffix_and_personal_exe_name() {
+        let release = release(
+            "v1",
+            false,
+            vec![
+                asset("sing-box_windows_amd64.exe"),
+                asset("sing-box-v1-windows-amd64.zip"),
+            ],
+        );
+
+        let zip = pick_windows_asset(&release, "windows-amd64.zip", CoreAssetFormat::Zip)
+            .expect("zip asset");
+        assert_eq!(zip.asset_name, "sing-box-v1-windows-amd64.zip");
+
+        let exe = pick_windows_asset(&release, "sing-box_windows_amd64.exe", CoreAssetFormat::Exe)
+            .expect("exe asset");
+        assert_eq!(exe.asset_name, "sing-box_windows_amd64.exe");
+        assert_eq!(exe.asset_format, CoreAssetFormat::Exe);
+    }
+
+    #[test]
+    fn personal_channel_uses_latest_non_draft_release() {
+        let releases = vec![
+            release("draft", true, Vec::new()),
+            release("v1.14.0-beta.10", false, Vec::new()),
+        ];
+
+        let selected = latest_non_draft(releases).expect("non-draft release");
+        assert_eq!(selected.tag_name, "v1.14.0-beta.10");
+    }
+
+    #[test]
+    fn maps_personal_asset_names_by_architecture() {
+        assert_eq!(
+            windows_asset_pattern(CoreAssetFormat::Exe, "x86_64").unwrap(),
+            "sing-box_windows_amd64.exe"
+        );
+        assert_eq!(
+            windows_asset_pattern(CoreAssetFormat::Exe, "aarch64").unwrap(),
+            "sing-box_windows_arm64.exe"
+        );
+    }
 }

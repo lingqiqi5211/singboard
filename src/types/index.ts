@@ -172,7 +172,7 @@ export interface AppConfig {
   configProfiles: ConfigProfile[]
   activeConfigProfileId: string
   closeToTray: boolean
-  coreUpdateSource: 'official' | 'ref1nd' | 'custom'
+  coreUpdateSource: 'official' | 'ref1nd' | 'lingqiqi' | 'custom'
   coreUpdateCustomRepo: string
   coreUpdateChannel: 'stable' | 'testing'
   coreUpdateMirror: string

@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 
+export type CoreAssetFormat = 'zip' | 'exe'
+
 export interface CoreUpdateInfo {
   version: string
   prerelease: boolean
@@ -9,6 +11,7 @@ export interface CoreUpdateInfo {
   assetSize: number
   /** GitHub 资产 SHA-256（"sha256:..."），个别源缺失时为空串 */
   assetDigest: string
+  assetFormat: CoreAssetFormat
 }
 
 export interface CoreUpdateResult {
@@ -22,14 +25,19 @@ export interface CoreUpdateProgress {
   total: number
 }
 
-export async function checkCoreUpdate(repo: string, channel: string): Promise<CoreUpdateInfo> {
-  return invoke<CoreUpdateInfo>('check_core_update', { repo, channel })
+export async function checkCoreUpdate(
+  repo: string,
+  channel: string,
+  assetFormat: CoreAssetFormat = 'zip',
+): Promise<CoreUpdateInfo> {
+  return invoke<CoreUpdateInfo>('check_core_update', { repo, channel, assetFormat })
 }
 
-/** 下载资产并解压，返回其中 sing-box.exe 的 SHA-256（用于同版本一致性校验） */
+/** 下载并准备核心资产，返回 sing-box.exe 的 SHA-256（用于同版本一致性校验） */
 export async function probeAssetExeHash(args: {
   assetUrl: string
   assetSize: number
+  assetFormat: CoreAssetFormat
   mirror: string
 }): Promise<string> {
   return invoke<string>('probe_asset_exe_hash', args)
@@ -38,6 +46,7 @@ export async function probeAssetExeHash(args: {
 export async function performCoreUpdate(args: {
   assetUrl: string
   assetSize: number
+  assetFormat: CoreAssetFormat
   mirror: string
   singboxPath: string
   serviceName: string
