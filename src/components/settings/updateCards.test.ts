@@ -36,12 +36,14 @@ function clearToasts() {
 describe('update cards', () => {
   const wrappers: VueWrapper[] = []
   let originalSingboxPath = ''
+  let originalSource: ReturnType<typeof useConfigStore>['config']['value']['coreUpdateSource']
 
   beforeEach(() => {
     tauri.invoke.mockReset()
     tauri.invoke.mockImplementation(() => Promise.resolve(null))
     clearToasts()
     originalSingboxPath = useConfigStore().config.value.singboxPath
+    originalSource = useConfigStore().config.value.coreUpdateSource
     localStorage.removeItem('singboard-core-install-record')
     localStorage.removeItem('singboard-core-install-record-v2')
   })
@@ -49,9 +51,32 @@ describe('update cards', () => {
   afterEach(() => {
     for (const wrapper of wrappers.splice(0)) wrapper.unmount()
     useConfigStore().config.value.singboxPath = originalSingboxPath
+    useConfigStore().config.value.coreUpdateSource = originalSource
     localStorage.removeItem('singboard-core-install-record')
     localStorage.removeItem('singboard-core-install-record-v2')
     clearToasts()
+  })
+
+  it('checks the personal source using latest releases and standalone EXE assets', async () => {
+    const { config } = useConfigStore()
+    config.value.coreUpdateSource = 'lingqiqi'
+    tauri.invoke.mockImplementation((command: string) => {
+      if (command === 'get_singbox_version') return Promise.resolve('sing-box version 1.14.0-beta.13')
+      if (command === 'check_core_update') return Promise.resolve({
+        version: 'v1.14.0-beta.13', prerelease: true, assetDigest: '', assetFormat: 'exe',
+      })
+      return Promise.resolve(null)
+    })
+    const wrapper = mount(CoreUpdateCard)
+    wrappers.push(wrapper)
+    expect(wrapper.text()).toContain('自动跟踪最新发布')
+    expect(wrapper.text()).not.toContain('版本通道')
+    await wrapper.get('button').trigger('click')
+    await flushPromises()
+    expect(tauri.invoke).toHaveBeenCalledWith('check_core_update', {
+      repo: 'lingqiqi5211/sing-box-p', channel: 'latest', assetFormat: 'exe',
+    })
+    expect(wrapper.get('.settings-update-status').text()).not.toContain('预发布')
   })
 
   it('keeps the panel check state visible and renders an unshadowed child spinner', async () => {
@@ -149,6 +174,7 @@ describe('update cards', () => {
       assetUrl: 'https://example.invalid/sing-box.zip',
       assetSize: 123,
       assetDigest,
+      assetFormat: 'zip',
     }
     localStorage.setItem('singboard-core-install-record', JSON.stringify({
       assetDigest,
@@ -173,6 +199,7 @@ describe('update cards', () => {
       assetUrl: info.assetUrl,
       assetSize: info.assetSize,
       assetDigest,
+      assetFormat: 'zip',
       mirror: config.value.coreUpdateMirror,
     })
     expect(wrapper.get('.settings-update-status').text()).toContain('已是最新版本')
@@ -190,6 +217,7 @@ describe('update cards', () => {
       assetUrl: 'https://example.invalid/sing-box.zip',
       assetSize: 123,
       assetDigest: `sha256:${'cd'.repeat(32)}`,
+      assetFormat: 'zip',
     }
     tauri.invoke.mockImplementation((command: string) => {
       switch (command) {
@@ -212,6 +240,7 @@ describe('update cards', () => {
       assetUrl: info.assetUrl,
       assetSize: info.assetSize,
       assetDigest: info.assetDigest,
+      assetFormat: 'zip',
       mirror: config.value.coreUpdateMirror,
       singboxPath: config.value.singboxPath,
     })

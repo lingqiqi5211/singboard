@@ -17,6 +17,14 @@ const CORE_EXE_NAME: &str = "sing-box.exe";
 /// 一致性校验阶段解压结果的清单，供随后的安装复用（同一资产不下载两次）
 const STAGED_MANIFEST: &str = "staged.json";
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreAssetFormat {
+    #[default]
+    Zip,
+    Exe,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CoreUpdateInfo {
@@ -28,6 +36,7 @@ pub struct CoreUpdateInfo {
     asset_size: u64,
     /// GitHub 资产的 SHA-256（形如 "sha256:..."），个别源可能缺失则为空串
     asset_digest: String,
+    asset_format: CoreAssetFormat,
 }
 
 #[derive(Serialize)]
@@ -51,6 +60,8 @@ struct StagedCore {
     asset_url: String,
     asset_size: u64,
     asset_digest: String,
+    #[serde(default)]
+    asset_format: CoreAssetFormat,
 }
 
 #[derive(Deserialize)]
@@ -88,12 +99,24 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     }
 }
 
-fn windows_arch_suffix() -> Result<String, String> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok("windows-amd64.zip".into()),
-        "aarch64" => Ok("windows-arm64.zip".into()),
-        other => Err(format!("不支持的 CPU 架构: {}", other)),
+fn windows_asset_pattern(
+    asset_format: CoreAssetFormat,
+    arch: &str,
+) -> Result<&'static str, String> {
+    match (asset_format, arch) {
+        (CoreAssetFormat::Zip, "x86_64") => Ok("windows-amd64.zip"),
+        (CoreAssetFormat::Zip, "aarch64") => Ok("windows-arm64.zip"),
+        (CoreAssetFormat::Exe, "x86_64") => Ok("sing-box_windows_amd64.exe"),
+        (CoreAssetFormat::Exe, "aarch64") => Ok("sing-box_windows_arm64.exe"),
+        (_, other) => Err(format!("不支持的 CPU 架构: {}", other)),
     }
+}
+
+fn downloaded_asset_path(staging: &Path, asset_format: CoreAssetFormat) -> PathBuf {
+    staging.join(match asset_format {
+        CoreAssetFormat::Zip => "core.zip",
+        CoreAssetFormat::Exe => "core.exe",
+    })
 }
 
 /// 下载与解压产物放在 %TEMP%\singboard（整个目录由核心更新独占，会被清空重建）。
@@ -116,21 +139,24 @@ fn take_staged(
     asset_url: &str,
     asset_size: u64,
     asset_digest: &str,
+    asset_format: CoreAssetFormat,
 ) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(staging.join(STAGED_MANIFEST)).ok()?;
     let staged: StagedCore = serde_json::from_str(&text).ok()?;
     if staged.asset_url != asset_url
         || staged.asset_size != asset_size
+        || staged.asset_format != asset_format
         || !core_asset_hash(&staged.asset_digest)
             .ok()?
             .eq_ignore_ascii_case(core_asset_hash(asset_digest).ok()?)
     {
         return None;
     }
-    extract_core_files(
-        &staging.join("core.zip"),
+    prepare_core_files(
+        &downloaded_asset_path(staging, asset_format),
         &staging.join("files"),
         asset_digest,
+        asset_format,
     )
     .ok()
 }
@@ -188,11 +214,18 @@ pub(crate) async fn github_get(url: &str) -> Result<reqwest::Response, String> {
     Ok(resp)
 }
 
-fn pick_windows_asset(release: &GhRelease, suffix: &str) -> Result<CoreUpdateInfo, String> {
+fn pick_windows_asset(
+    release: &GhRelease,
+    suffix: &str,
+    asset_format: CoreAssetFormat,
+) -> Result<CoreUpdateInfo, String> {
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name.ends_with(suffix))
+        .find(|a| match asset_format {
+            CoreAssetFormat::Zip => a.name.ends_with(suffix),
+            CoreAssetFormat::Exe => a.name == suffix,
+        })
         .ok_or_else(|| {
             format!(
                 "该版本未提供适用于 {} 的资产",
@@ -207,17 +240,27 @@ fn pick_windows_asset(release: &GhRelease, suffix: &str) -> Result<CoreUpdateInf
         asset_url: asset.browser_download_url.clone(),
         asset_size: asset.size,
         asset_digest: asset.digest.clone().unwrap_or_default(),
+        asset_format,
     })
 }
 
 #[tauri::command]
-pub async fn check_core_update(repo: String, channel: String) -> Result<CoreUpdateInfo, String> {
+pub async fn check_core_update(
+    repo: String,
+    channel: String,
+    asset_format: Option<CoreAssetFormat>,
+) -> Result<CoreUpdateInfo, String> {
     let repo = repo.trim().to_string();
     validate_repo(&repo)?;
-    let suffix = windows_arch_suffix()?;
+    let asset_format = asset_format.unwrap_or_default();
+    let suffix = windows_asset_pattern(asset_format, std::env::consts::ARCH)?;
 
-    let release = if channel == "testing" {
-        let url = format!("https://api.github.com/repos/{}/releases?per_page=10", repo);
+    let release = if channel == "testing" || channel == "latest" {
+        let per_page = if channel == "latest" { 100 } else { 10 };
+        let url = format!(
+            "https://api.github.com/repos/{}/releases?per_page={}",
+            repo, per_page
+        );
         let releases: Vec<GhRelease> = github_get(&url)
             .await?
             .json()
@@ -236,7 +279,7 @@ pub async fn check_core_update(repo: String, channel: String) -> Result<CoreUpda
             .map_err(|e| format!("解析 GitHub API 响应失败: {}", e))?
     };
 
-    pick_windows_asset(&release, &suffix)
+    pick_windows_asset(&release, suffix, asset_format)
 }
 
 pub(crate) async fn download_asset(
@@ -342,6 +385,30 @@ fn extract_core_files(
         return Err(format!("压缩包内未找到 {}", CORE_EXE_NAME));
     }
     Ok(dlls)
+}
+
+/// ZIP 和独立 EXE 都先校验发布资产，再重新生成隔离的安装文件目录。
+fn prepare_core_files(
+    asset_path: &Path,
+    files_dir: &Path,
+    asset_digest: &str,
+    asset_format: CoreAssetFormat,
+) -> Result<Vec<String>, String> {
+    if asset_format == CoreAssetFormat::Zip {
+        return extract_core_files(asset_path, files_dir, asset_digest);
+    }
+    let expected = core_asset_hash(asset_digest)?;
+    let bytes = std::fs::read(asset_path).map_err(|e| format!("读取核心失败: {}", e))?;
+    if !format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(expected) {
+        return Err("核心文件 SHA-256 校验失败，已中止更新".into());
+    }
+    if files_dir.exists() {
+        std::fs::remove_dir_all(files_dir).map_err(|e| format!("清理临时目录失败: {}", e))?;
+    }
+    std::fs::create_dir_all(files_dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
+    std::fs::write(files_dir.join(CORE_EXE_NAME), bytes)
+        .map_err(|e| format!("写入临时文件失败: {}", e))?;
+    Ok(Vec::new())
 }
 
 /// 对下载的核心跑一次 `version`，确认能运行并取版本串
@@ -499,8 +566,10 @@ pub async fn probe_asset_exe_hash(
     asset_url: String,
     asset_size: u64,
     asset_digest: String,
+    asset_format: Option<CoreAssetFormat>,
     mirror: Option<String>,
 ) -> Result<String, String> {
+    let asset_format = asset_format.unwrap_or_default();
     core_asset_hash(&asset_digest)?;
     let _guard = UPDATE_LOCK
         .try_lock()
@@ -515,7 +584,7 @@ pub async fn probe_asset_exe_hash(
     };
 
     let download_url = apply_mirror(&mirror, &asset_url);
-    let zip_path = staging.join("core.zip");
+    let zip_path = downloaded_asset_path(&staging, asset_format);
     download_asset(
         &app,
         CORE_PROGRESS_EVENT,
@@ -533,12 +602,13 @@ pub async fn probe_asset_exe_hash(
         let asset_url = asset_url.clone();
         tokio::task::spawn_blocking(move || {
             let files_dir = staging.join("files");
-            extract_core_files(&zip_path, &files_dir, &asset_digest)?;
+            prepare_core_files(&zip_path, &files_dir, &asset_digest, asset_format)?;
             let exe_hash = crate::service::helper::sha256_file(&files_dir.join(CORE_EXE_NAME))?;
             let manifest = serde_json::to_string(&StagedCore {
                 asset_url,
                 asset_size,
                 asset_digest,
+                asset_format,
             })
             .map_err(|e| format!("写入清单失败: {}", e))?;
             std::fs::write(staging.join(STAGED_MANIFEST), manifest)
@@ -560,9 +630,11 @@ pub async fn perform_core_update(
     asset_url: String,
     asset_size: u64,
     asset_digest: String,
+    asset_format: Option<CoreAssetFormat>,
     mirror: Option<String>,
     singbox_path: String,
 ) -> Result<CoreUpdateResult, String> {
+    let asset_format = asset_format.unwrap_or_default();
     core_asset_hash(&asset_digest)?;
     let service_name = crate::service::component::app_service_name(&app)?;
     let _guard = UPDATE_LOCK
@@ -592,7 +664,13 @@ pub async fn perform_core_update(
         let asset_url = asset_url.clone();
         let asset_digest = asset_digest.clone();
         tokio::task::spawn_blocking(move || {
-            take_staged(&staging, &asset_url, asset_size, &asset_digest)
+            take_staged(
+                &staging,
+                &asset_url,
+                asset_size,
+                &asset_digest,
+                asset_format,
+            )
         })
         .await
         .map_err(|e| format!("任务执行失败: {}", e))?
@@ -604,7 +682,7 @@ pub async fn perform_core_update(
             std::fs::create_dir_all(&staging).map_err(|e| format!("创建临时目录失败: {}", e))?;
 
             let download_url = apply_mirror(&mirror, &asset_url);
-            let zip_path = staging.join("core.zip");
+            let zip_path = downloaded_asset_path(&staging, asset_format);
             download_asset(
                 &app,
                 CORE_PROGRESS_EVENT,
@@ -618,7 +696,7 @@ pub async fn perform_core_update(
             emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
             let files_dir = files_dir.clone();
             tokio::task::spawn_blocking(move || {
-                extract_core_files(&zip_path, &files_dir, &asset_digest)
+                prepare_core_files(&zip_path, &files_dir, &asset_digest, asset_format)
             })
             .await
             .map_err(|e| format!("任务执行失败: {}", e))
@@ -710,6 +788,7 @@ mod tests {
                 asset_url: ASSET_URL.to_string(),
                 asset_size,
                 asset_digest: asset_digest.to_string(),
+                asset_format: CoreAssetFormat::Zip,
             };
             std::fs::write(
                 self.0.join(STAGED_MANIFEST),
@@ -760,7 +839,7 @@ mod tests {
         std::fs::write(files.join("libcronet.dll"), b"changed dll").unwrap();
         std::fs::write(files.join("untrusted.dll"), b"extra dll").unwrap();
 
-        let dlls = take_staged(&staging.0, ASSET_URL, size, &digest).unwrap();
+        let dlls = take_staged(&staging.0, ASSET_URL, size, &digest, CoreAssetFormat::Zip).unwrap();
 
         assert_eq!(dlls, vec!["libcronet.dll"]);
         assert_eq!(
@@ -781,7 +860,7 @@ mod tests {
         staging.write_archive(b"changed exe", b"changed dll");
         staging.write_manifest(size, &digest);
 
-        assert!(take_staged(&staging.0, ASSET_URL, size, &digest).is_none());
+        assert!(take_staged(&staging.0, ASSET_URL, size, &digest, CoreAssetFormat::Zip).is_none());
         assert!(!staging.0.join("files").exists());
     }
 
@@ -796,17 +875,28 @@ mod tests {
                 &staging.0,
                 "https://example.invalid/other.zip",
                 size,
-                &digest
+                &digest,
+                CoreAssetFormat::Zip,
             )
             .is_none()
         );
-        assert!(take_staged(&staging.0, ASSET_URL, size + 1, &digest).is_none());
+        assert!(
+            take_staged(
+                &staging.0,
+                ASSET_URL,
+                size + 1,
+                &digest,
+                CoreAssetFormat::Zip
+            )
+            .is_none()
+        );
         assert!(
             take_staged(
                 &staging.0,
                 ASSET_URL,
                 size,
-                &format!("sha256:{}", "0".repeat(64))
+                &format!("sha256:{}", "0".repeat(64)),
+                CoreAssetFormat::Zip,
             )
             .is_none()
         );
@@ -829,7 +919,76 @@ mod tests {
         )
         .unwrap();
 
-        assert!(take_staged(&staging.0, ASSET_URL, size, &digest).is_none());
+        assert!(take_staged(&staging.0, ASSET_URL, size, &digest, CoreAssetFormat::Zip).is_none());
         assert!(!staging.0.join("files").exists());
+    }
+
+    #[test]
+    fn personal_asset_names_match_architecture_and_release() {
+        assert_eq!(
+            windows_asset_pattern(CoreAssetFormat::Exe, "x86_64").unwrap(),
+            "sing-box_windows_amd64.exe"
+        );
+        assert_eq!(
+            windows_asset_pattern(CoreAssetFormat::Exe, "aarch64").unwrap(),
+            "sing-box_windows_arm64.exe"
+        );
+        let release = GhRelease {
+            tag_name: "v1.14.0-beta.13".into(),
+            prerelease: true,
+            draft: false,
+            published_at: None,
+            assets: vec![GhAsset {
+                name: "sing-box_windows_amd64.exe".into(),
+                browser_download_url: "https://example.invalid/core.exe".into(),
+                size: 123,
+                digest: None,
+            }],
+        };
+        let info = pick_windows_asset(&release, "sing-box_windows_amd64.exe", CoreAssetFormat::Exe)
+            .unwrap();
+        assert_eq!(info.asset_format, CoreAssetFormat::Exe);
+        assert!(pick_windows_asset(&release, "windows-amd64.zip", CoreAssetFormat::Zip).is_err());
+    }
+
+    #[test]
+    fn cached_exe_is_verified_and_restores_only_trusted_files() {
+        let staging = TestStaging::new();
+        let path = downloaded_asset_path(&staging.0, CoreAssetFormat::Exe);
+        std::fs::write(&path, b"trusted exe").unwrap();
+        let digest = format!(
+            "sha256:{}",
+            crate::service::helper::sha256_file(&path).unwrap()
+        );
+        let manifest = StagedCore {
+            asset_url: ASSET_URL.into(),
+            asset_size: 11,
+            asset_digest: digest.clone(),
+            asset_format: CoreAssetFormat::Exe,
+        };
+        std::fs::write(
+            staging.0.join(STAGED_MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let files = staging.0.join("files");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(files.join(CORE_EXE_NAME), b"changed exe").unwrap();
+        std::fs::write(files.join("untrusted.dll"), b"extra dll").unwrap();
+        assert!(take_staged(&staging.0, ASSET_URL, 11, &digest, CoreAssetFormat::Zip).is_none());
+        assert_eq!(
+            take_staged(&staging.0, ASSET_URL, 11, &digest, CoreAssetFormat::Exe).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            std::fs::read(files.join(CORE_EXE_NAME)).unwrap(),
+            b"trusted exe"
+        );
+        assert!(!files.join("untrusted.dll").exists());
+        std::fs::remove_dir_all(&files).unwrap();
+        std::fs::write(&path, b"changed exe").unwrap();
+        assert!(take_staged(&staging.0, ASSET_URL, 11, &digest, CoreAssetFormat::Exe).is_none());
+        assert!(!files.exists());
+        assert!(prepare_core_files(&path, &files, "", CoreAssetFormat::Exe).is_err());
     }
 }
