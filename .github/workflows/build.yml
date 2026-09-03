@@ -2,6 +2,11 @@ name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build (for example, v3.3.1)
+        required: true
+        type: string
   push:
     tags:
       - "v*"
@@ -14,6 +19,7 @@ jobs:
     name: Build Windows app
     runs-on: windows-latest
     env:
+      SINGBOARD_PANEL_UPDATE_REPO: ${{ github.repository }}
       WINDOWS_CERT_PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
 
@@ -21,6 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -31,6 +38,9 @@ jobs:
 
       - name: Install pnpm
         run: npm install --global pnpm@11.13.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -48,14 +58,38 @@ jobs:
 
       - name: Read release tag
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSH_TAG: ${{ github.ref_name }}
         run: |
-          $tag = git describe --tags --abbrev=0
-          if ($LASTEXITCODE -ne 0 -or -not $tag) {
-            throw "No tag found in the repository; push a tag before building"
+          $tag = if ($env:EVENT_NAME -eq "workflow_dispatch") { $env:INPUT_TAG } else { $env:PUSH_TAG }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+            throw "Invalid release tag: $tag"
+          }
+
+          $head = git rev-parse HEAD
+          $tagCommit = git rev-list -n 1 "refs/tags/$tag"
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $head) {
+            throw "Release tag $tag does not point to the checked-out commit"
           }
 
           "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
           "APP_VERSION=$($tag -replace '^v', '')" >> $env:GITHUB_ENV
+
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object { $_.name -eq "singboard" })
+          if ($package.Count -ne 1) {
+            throw "Expected exactly one singboard package in Cargo metadata"
+          }
+
+          $packageVersion = $package[0].version
+          if ($packageVersion -ne $env:APP_VERSION) {
+            throw "Release tag $env:RELEASE_TAG does not match package version $packageVersion"
+          }
 
       - name: Import code signing certificate
         if: env.WINDOWS_CERT_PFX_B64 != ''

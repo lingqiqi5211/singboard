@@ -5,16 +5,51 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::update::{
-    GhRelease, UPDATE_LOCK, apply_mirror, download_asset, emit_progress, github_get, retry_io,
+    GhAsset, GhRelease, UPDATE_LOCK, apply_mirror, download_asset, emit_progress, github_get,
+    retry_io,
 };
 
-const PANEL_REPO: &str = "Yuu518/singboard";
+const DEFAULT_PANEL_REPO: &str = "lingqiqi5211/singboard";
 const PANEL_ASSET: &str = "singboard.exe";
 const PROGRESS_EVENT: &str = "panel-update-progress";
 pub const APPLY_UPDATE_FLAG: &str = "--apply-update";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+fn panel_repo() -> &'static str {
+    option_env!("SINGBOARD_PANEL_UPDATE_REPO").unwrap_or(DEFAULT_PANEL_REPO)
+}
+
+fn validate_panel_asset_url(asset_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(asset_url).map_err(|_| "面板下载地址无效".to_string())?;
+    let (owner, repo) = panel_repo()
+        .split_once('/')
+        .ok_or_else(|| "面板更新仓库配置无效".to_string())?;
+    let segments: Vec<_> = url
+        .path_segments()
+        .ok_or_else(|| "面板下载地址无效".to_string())?
+        .collect();
+    let trusted = url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && segments.len() == 6
+        && segments[0].eq_ignore_ascii_case(owner)
+        && segments[1].eq_ignore_ascii_case(repo)
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && !segments[4].is_empty()
+        && segments[5].eq_ignore_ascii_case(PANEL_ASSET);
+
+    if trusted {
+        Ok(())
+    } else {
+        Err("面板下载地址不属于受信任的发布源".into())
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,20 +108,30 @@ fn local_out_of_sync(asset_digest: &str) -> bool {
     }
 }
 
-#[tauri::command]
-pub async fn check_panel_update() -> Result<PanelUpdateInfo, String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", PANEL_REPO);
-    let release: GhRelease = github_get(&url)
+async fn latest_panel_release() -> Result<GhRelease, String> {
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        panel_repo()
+    );
+    github_get(&url)
         .await?
         .json()
         .await
-        .map_err(|e| format!("解析 GitHub API 响应失败: {}", e))?;
+        .map_err(|e| format!("解析 GitHub API 响应失败: {}", e))
+}
 
-    let asset = release
+fn panel_asset(release: &GhRelease) -> Result<&GhAsset, String> {
+    release
         .assets
         .iter()
-        .find(|a| a.name.eq_ignore_ascii_case(PANEL_ASSET))
-        .ok_or_else(|| format!("该版本未提供 {} 资产", PANEL_ASSET))?;
+        .find(|asset| asset.name.eq_ignore_ascii_case(PANEL_ASSET))
+        .ok_or_else(|| format!("该版本未提供 {} 资产", PANEL_ASSET))
+}
+
+#[tauri::command]
+pub async fn check_panel_update() -> Result<PanelUpdateInfo, String> {
+    let release = latest_panel_release().await?;
+    let asset = panel_asset(&release)?;
 
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let latest_version = release.tag_name.trim_start_matches(['v', 'V']).to_string();
@@ -107,21 +152,15 @@ pub async fn check_panel_update() -> Result<PanelUpdateInfo, String> {
         out_of_sync,
         current_version,
         latest_version,
-        published_at: release.published_at.unwrap_or_default(),
+        published_at: release.published_at.clone().unwrap_or_default(),
         asset_url: asset.browser_download_url.clone(),
         asset_size: asset.size,
         asset_digest,
     })
 }
 
-fn verify_digest(file: &Path, asset_digest: &str, mirror: &Option<String>) -> Result<(), String> {
-    let Some(expected) = digest_hash(asset_digest) else {
-        let mirrored = mirror.as_deref().map(str::trim).is_some_and(|m| !m.is_empty());
-        if mirrored {
-            return Err("该版本缺少校验信息，已中止更新".into());
-        }
-        return Ok(());
-    };
+fn verify_digest(file: &Path, asset_digest: &str) -> Result<(), String> {
+    let expected = digest_hash(asset_digest).ok_or("该版本缺少校验信息，已中止更新")?;
 
     let actual = crate::service::helper::sha256_file(file)?;
     if actual.eq_ignore_ascii_case(expected) {
@@ -139,9 +178,21 @@ pub async fn perform_panel_update(
     asset_digest: String,
     mirror: Option<String>,
 ) -> Result<(), String> {
+    validate_panel_asset_url(&asset_url)?;
+
     let _guard = UPDATE_LOCK
         .try_lock()
         .map_err(|_| "更新正在进行中".to_string())?;
+
+    let release = latest_panel_release().await?;
+    let trusted_asset = panel_asset(&release)?;
+    let trusted_digest = trusted_asset.digest.as_deref().unwrap_or_default();
+    if trusted_asset.browser_download_url != asset_url
+        || trusted_asset.size != asset_size
+        || trusted_digest != asset_digest
+    {
+        return Err("最新发布已发生变化，请重新检查更新".into());
+    }
 
     let target = std::env::current_exe().map_err(|e| format!("获取面板路径失败: {}", e))?;
 
@@ -155,20 +206,14 @@ pub async fn perform_panel_update(
 
     let staged_exe = staging.join(PANEL_ASSET);
     let download_url = apply_mirror(&mirror, &asset_url);
-    download_asset(
-        &app,
-        PROGRESS_EVENT,
-        &download_url,
-        asset_size,
-        &staged_exe,
-    )
-    .await
-    .map_err(cleanup)?;
+    download_asset(&app, PROGRESS_EVENT, &download_url, asset_size, &staged_exe)
+        .await
+        .map_err(cleanup)?;
 
     emit_progress(&app, PROGRESS_EVENT, "verify", 0, 0);
     {
         let staged_exe = staged_exe.clone();
-        tokio::task::spawn_blocking(move || verify_digest(&staged_exe, &asset_digest, &mirror))
+        tokio::task::spawn_blocking(move || verify_digest(&staged_exe, &asset_digest))
             .await
             .map_err(|e| format!("任务执行失败: {}", e))
             .and_then(|r| r)
@@ -301,6 +346,51 @@ mod tests {
         assert!(is_newer("nightly", "3.2.4"));
         assert!(!is_newer("nightly", "nightly"));
         assert!(!is_newer("vnightly", "nightly"));
+    }
+
+    #[test]
+    fn panel_repo_has_owner_and_name() {
+        let mut parts = panel_repo().split('/');
+        assert!(parts.next().is_some_and(|part| !part.is_empty()));
+        assert!(parts.next().is_some_and(|part| !part.is_empty()));
+        assert!(parts.next().is_none());
+    }
+
+    #[test]
+    fn accepts_asset_from_configured_repo() {
+        let url = format!(
+            "https://github.com/{}/releases/download/v3.3.1/{}",
+            panel_repo(),
+            PANEL_ASSET
+        );
+        assert!(validate_panel_asset_url(&url).is_ok());
+    }
+
+    #[test]
+    fn rejects_asset_outside_configured_repo() {
+        assert!(
+            validate_panel_asset_url(
+                "https://github.com/untrusted/project/releases/download/v3.3.1/singboard.exe"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_panel_asset_url(
+                "http://github.com/lingqiqi5211/singboard/releases/download/v3.3.1/singboard.exe"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_asset_without_digest() {
+        let dir = temp_case("missing-digest");
+        let file = dir.join(PANEL_ASSET);
+        std::fs::write(&file, b"panel").unwrap();
+
+        assert!(verify_digest(&file, "").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn temp_case(name: &str) -> PathBuf {
