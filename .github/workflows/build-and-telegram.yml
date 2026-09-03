@@ -12,6 +12,8 @@ jobs:
   build:
     name: Build ${{ matrix.channel }}
     runs-on: windows-latest
+    env:
+      SINGBOARD_PANEL_UPDATE_REPO: ${{ github.repository }}
     permissions:
       contents: read
     strategy:
