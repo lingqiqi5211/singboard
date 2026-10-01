@@ -79,8 +79,11 @@ jobs:
 
       - name: Validate release version
         shell: pwsh
+        working-directory: src-tauri
         run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $metadataJson = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "Unable to read Cargo metadata" }
+          $metadata = $metadataJson | ConvertFrom-Json
           $package = @($metadata.packages | Where-Object { $_.name -eq "singboard" })
           if ($package.Count -ne 1) {
             throw "Expected exactly one singboard package in Cargo metadata"
