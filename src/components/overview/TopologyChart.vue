@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import * as echarts from 'echarts/core'
 import { SankeyChart } from 'echarts/charts'
 import { TooltipComponent } from 'echarts/components'
@@ -20,9 +20,36 @@ const layerColors = ['#0A84FF', '#30D158', '#FF9F0A', '#FF6482']
 const darkThemes = new Set(['dark'])
 const labelColor = computed(() => (darkThemes.has(resolvedTheme.value) ? '#ffffff' : '#000000'))
 
+// Only topology fields matter here; traffic-only snapshots reuse the projection.
+const topologyCounts = computed((previous?: Map<string, number>) => {
+  const counts = new Map<string, number>()
+  for (const conn of connections.value) {
+    const chains = conn.chains || []
+    if (chains.length === 0) continue
+    const key = JSON.stringify([
+      conn.metadata.sourceIP || 'unknown',
+      conn.rulePayload ? `${conn.rule}: ${conn.rulePayload}` : conn.rule,
+      chains[0],
+      chains[chains.length - 1],
+    ])
+    counts.set(key, (counts.get(key) || 0) + 1)
+  }
+  if (previous?.size === counts.size) {
+    let unchanged = true
+    for (const [key, count] of counts) {
+      if (previous.get(key) !== count) {
+        unchanged = false
+        break
+      }
+    }
+    if (unchanged) return previous
+  }
+  return counts
+})
+
 const sankeyData = computed(() => {
-  const conns = connections.value
-  if (!conns || conns.length === 0) return { nodes: [], links: [] }
+  const counts = topologyCounts.value
+  if (counts.size === 0) return { nodes: [], links: [] }
 
   const nodeMap = new Map<string, number>()
   const linkMap = new Map<string, number>()
@@ -39,16 +66,8 @@ const sankeyData = computed(() => {
     return nodeMap.get(name)!
   }
 
-  conns.forEach((conn) => {
-    const sourceIP = conn.metadata.sourceIP || 'unknown'
-    const rulePayload = conn.rulePayload
-      ? `${conn.rule}: ${conn.rulePayload}`
-      : conn.rule
-    const chains = conn.chains || []
-    if (chains.length === 0) return
-
-    const chainLast = chains[chains.length - 1]
-    const chainFirst = chains[0]
+  counts.forEach((count, key) => {
+    const [sourceIP, rulePayload, chainFirst, chainLast] = JSON.parse(key) as [string, string, string, string]
 
     const srcNode = addNode(sourceIP, 0, '来源 IP')
     const ruleNode = addNode(rulePayload, 1, '规则匹配')
@@ -57,17 +76,17 @@ const sankeyData = computed(() => {
       const exitNode = addNode(chainFirst, 3, '代理出口')
       const l1 = `${srcNode}-${ruleNode}`
       const l2 = `${ruleNode}-${exitNode}`
-      linkMap.set(l1, (linkMap.get(l1) || 0) + 1)
-      linkMap.set(l2, (linkMap.get(l2) || 0) + 1)
+      linkMap.set(l1, (linkMap.get(l1) || 0) + count)
+      linkMap.set(l2, (linkMap.get(l2) || 0) + count)
     } else {
       const entryNode = addNode(chainLast, 2, '代理入口')
       const exitNode = addNode(chainFirst, 3, '代理出口')
       const l1 = `${srcNode}-${ruleNode}`
       const l2 = `${ruleNode}-${entryNode}`
       const l3 = `${entryNode}-${exitNode}`
-      linkMap.set(l1, (linkMap.get(l1) || 0) + 1)
-      linkMap.set(l2, (linkMap.get(l2) || 0) + 1)
-      linkMap.set(l3, (linkMap.get(l3) || 0) + 1)
+      linkMap.set(l1, (linkMap.get(l1) || 0) + count)
+      linkMap.set(l2, (linkMap.get(l2) || 0) + count)
+      linkMap.set(l3, (linkMap.get(l3) || 0) + count)
     }
   })
 
@@ -181,8 +200,7 @@ onMounted(() => {
     myChart.on('hideTip', () => { isPaused.value = false })
   }
 
-  watch(sankeyData, () => updateChart(), { deep: true })
-  watch(resolvedTheme, () => updateChart())
+  watch([sankeyData, resolvedTheme, isPaused], () => updateChart())
 
   resizeOb = new ResizeObserver(() => {
     myChart?.resize()

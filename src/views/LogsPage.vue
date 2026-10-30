@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, nextTick, watch } from 'vue'
+import { ref, watch } from 'vue'
 import { useLogsStore } from '@/stores/logs'
 
 const {
@@ -30,15 +30,14 @@ function levelColor(type: string): string {
   }
 }
 
-watch(filteredLogs, () => {
-  if (autoScroll.value) {
-    nextTick(() => {
-      if (logContainer.value) {
-        logContainer.value.scrollTop = logContainer.value.scrollHeight
-      }
-    })
+watch([
+  () => filteredLogs.value.length,
+  () => filteredLogs.value[filteredLogs.value.length - 1],
+], () => {
+  if (autoScroll.value && logContainer.value) {
+    logContainer.value.scrollTop = logContainer.value.scrollHeight
   }
-}, { deep: true })
+}, { flush: 'post' })
 
 function handleScroll() {
   if (!logContainer.value) return
