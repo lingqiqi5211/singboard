@@ -49,8 +49,8 @@
 
 ## Requirements
 
-- Node.js 18+
-- `pnpm`
+- Node.js 24+
+- `pnpm` 11.20.0 (pinned in `package.json`)
 - Rust stable (recommended via `rustup`)
 - Windows C++ Build Tools (MSVC)
 - WebView2 Runtime

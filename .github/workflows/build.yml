@@ -37,7 +37,7 @@ jobs:
           node-version: 24
 
       - name: Install pnpm
-        run: npm install --global pnpm@11.13.0
+        run: npm install --global pnpm@11.20.0
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
