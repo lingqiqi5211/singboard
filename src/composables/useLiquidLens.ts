@@ -1,6 +1,7 @@
 import { onBeforeUnmount, watch } from 'vue'
 import { useConfigStore } from '@/stores/config'
 import { useBackgroundStore } from '@/stores/background'
+import { isClearGlass } from '@/utils/glassTint'
 
 const BASE_LENS_SELECTOR = '.glass-float, .glass-popover'
 const CARD_LENS_SELECTOR = '.surface-card, .settings-card'
@@ -45,6 +46,23 @@ function gradRoundedRect(x: number, y: number, halfW: number, halfH: number, rad
   return cx >= cy ? [sx, 0] : [0, sy]
 }
 
+function lensDirection(
+  x: number,
+  y: number,
+  halfW: number,
+  halfH: number,
+  gradRadius: number,
+  depthEffect: boolean,
+): [number, number] {
+  const [gx, gy] = gradRoundedRect(x, y, halfW, halfH, gradRadius)
+  if (!depthEffect) return [gx, gy]
+  const centerLength = Math.hypot(x, y) || 1
+  const sx = gx + x / centerLength
+  const sy = gy + y / centerLength
+  const length = Math.hypot(sx, sy) || 1
+  return [sx / length, sy / length]
+}
+
 export interface MapRegion {
   x: number
   y: number
@@ -59,6 +77,7 @@ export function buildDisplacementMap(
   refractionHeight = REFRACTION_HEIGHT,
   refractionAmount = REFRACTION_AMOUNT,
   region: MapRegion = { x: 0, y: 0, width, height },
+  depthEffect = false,
 ): Uint8ClampedArray {
   const data = new Uint8ClampedArray(region.width * region.height * 4)
   const halfW = width / 2
@@ -76,7 +95,7 @@ export function buildDisplacementMap(
       if (-sd < refractionHeight) {
         const t = 1 - -sd / refractionHeight
         const d = circleMap(t) * refractionAmount
-        const [gx, gy] = gradRoundedRect(x, y, halfW, halfH, gradRadius)
+        const [gx, gy] = lensDirection(x, y, halfW, halfH, gradRadius, depthEffect)
         dx = -d * gx
         dy = -d * gy
         edge = t * t * (3 - 2 * t)
@@ -141,6 +160,7 @@ export interface LensOptions {
   chroma?: boolean
   frost?: number
   amount?: number
+  spread?: number
 }
 
 export interface MapImage extends MapRegion {
@@ -152,7 +172,7 @@ export function buildLensFilter(
   height: number,
   images: MapImage[],
   id: string,
-  { chroma = true, frost = 0, amount = REFRACTION_AMOUNT }: LensOptions = {},
+  { chroma = true, frost = 0, amount = REFRACTION_AMOUNT, spread = CHROMA_SPREAD }: LensOptions = {},
 ): SVGFilterElement {
   const filter = svgElement('filter', {
     id,
@@ -182,7 +202,7 @@ export function buildLensFilter(
     merge.append(svgElement('feMergeNode', { in: `map-${index}` }))
   })
   filter.append(merge)
-  if (chroma) appendChromaticRefraction(filter, amount)
+  if (chroma) appendChromaticRefraction(filter, amount, spread)
   else {
     filter.append(
       svgElement('feDisplacementMap', {
@@ -212,13 +232,31 @@ export function buildLensFilter(
   return filter
 }
 
-function appendChromaticRefraction(filter: SVGFilterElement, amount: number) {
+export function reshapeLensFilter(filter: SVGFilterElement, width: number, height: number, images: MapImage[]): boolean {
+  const feImages = filter.querySelectorAll('feImage')
+  if (feImages.length !== images.length) return false
+  filter.setAttribute('width', String(width))
+  filter.setAttribute('height', String(height))
+  filter.querySelector('feFlood')?.setAttribute('width', String(width))
+  filter.querySelector('feFlood')?.setAttribute('height', String(height))
+  images.forEach((image, index) => {
+    const feImage = feImages[index]
+    feImage.setAttribute('x', String(image.x))
+    feImage.setAttribute('y', String(image.y))
+    feImage.setAttribute('width', String(image.width))
+    feImage.setAttribute('height', String(image.height))
+    if (feImage.getAttribute('href') !== image.href) feImage.setAttribute('href', image.href)
+  })
+  return true
+}
+
+function appendChromaticRefraction(filter: SVGFilterElement, amount: number, spread: number) {
   CHANNELS.forEach((channel, index) => {
     filter.append(
       svgElement('feDisplacementMap', {
         in: 'SourceGraphic',
         in2: 'map',
-        scale: amount * 2 * (1 + index * CHROMA_SPREAD),
+        scale: amount * 2 * (1 + index * spread),
         xChannelSelector: 'R',
         yChannelSelector: 'G',
         result: `${channel.name}-shift`,
@@ -240,6 +278,11 @@ function appendChromaticRefraction(filter: SVGFilterElement, amount: number) {
 interface LensEntry {
   filter: SVGFilterElement | null
   key: string
+  shape: string
+}
+
+export function backdropLensSupported(userAgent = navigator.userAgent): boolean {
+  return !/Android/i.test(userAgent)
 }
 
 export function useLiquidLens() {
@@ -247,6 +290,7 @@ export function useLiquidLens() {
   const { hasBackground } = useBackgroundStore()
   const entries = new Map<HTMLElement, LensEntry>()
   const tileCache = new Map<string, Promise<string>>()
+  const decodedTiles = new Map<string, string>()
   const reducedTransparency = window.matchMedia('(prefers-reduced-transparency: reduce)')
   let svg: SVGSVGElement | null = null
   let mutationObserver: MutationObserver | null = null
@@ -267,14 +311,31 @@ export function useLiquidLens() {
     return svg
   }
 
+  function tileKey(source: MapTile['source'], radius: number, band: number, amount: number): string {
+    return `${source.mapWidth}x${source.mapHeight}:${source.x},${source.y},${source.width},${source.height}@${radius}~${band}~${amount}`
+  }
+
   function renderTile(source: MapTile['source'], radius: number, band: number, amount: number): Promise<string> {
-    const key = `${source.mapWidth}x${source.mapHeight}:${source.x},${source.y},${source.width},${source.height}@${radius}~${band}~${amount}`
+    const key = tileKey(source, radius, band, amount)
     let href = tileCache.get(key)
     if (!href) {
-      href = decodeTile(source, radius, band, amount)
+      href = decodeTile(source, radius, band, amount).then((value) => {
+        if (value) decodedTiles.set(key, value)
+        return value
+      })
       tileCache.set(key, href)
     }
     return href
+  }
+
+  function decodedMap(width: number, height: number, radius: number, band: number, amount: number): MapImage[] | null {
+    const images: MapImage[] = []
+    for (const tile of mapTiles(width, height, radius, band)) {
+      const href = decodedTiles.get(tileKey(tile.source, radius, band, amount))
+      if (!href) return null
+      images.push({ x: tile.x, y: tile.y, width: tile.width, height: tile.height, href })
+    }
+    return images
   }
 
   async function decodeTile(source: MapTile['source'], radius: number, band: number, amount: number): Promise<string> {
@@ -327,15 +388,24 @@ export function useLiquidLens() {
     const radius = parseFloat(style.borderTopLeftRadius) || 0
     const { options, band } = lensPlan(element, style)
     const key = `${width}x${height}@${radius}~${options.frost}`
+    const amount = options.amount ?? REFRACTION_AMOUNT
+    const shape = `${radius}~${band}~${amount}~${options.frost}~${options.chroma}`
     let entry = entries.get(element)
     if (entry?.key === key) return
     if (!entry) {
-      entry = { filter: null, key }
+      entry = { filter: null, key, shape: '' }
       entries.set(element, entry)
       resizeObserver?.observe(element)
     }
+    if (entry.filter && entry.shape === shape) {
+      const decoded = decodedMap(width, height, radius, band, amount)
+      if (decoded && reshapeLensFilter(entry.filter, width, height, decoded)) {
+        entry.key = key
+        return
+      }
+    }
     entry.key = key
-    const images = await renderMap(width, height, radius, band, options.amount ?? REFRACTION_AMOUNT)
+    const images = await renderMap(width, height, radius, band, amount)
     if (entries.get(element) !== entry || entry.key !== key || !images.length) return
     const filter = await createFilter(width, height, images, options)
     if (entries.get(element) !== entry || entry.key !== key) {
@@ -345,6 +415,7 @@ export function useLiquidLens() {
     element.style.setProperty('--glass-lens', `url(#${filter.id})`)
     entry.filter?.remove()
     entry.filter = filter
+    entry.shape = shape
   }
 
   function release(element: HTMLElement) {
@@ -391,11 +462,11 @@ export function useLiquidLens() {
   }
 
   function sync() {
-    if (config.value.glassMode === 'clear' && !reducedTransparency.matches) start()
+    if (isClearGlass(config.value.glassTint) && !reducedTransparency.matches && backdropLensSupported()) start()
     else stop()
   }
 
-  watch(() => config.value.glassMode, sync, { immediate: true })
+  watch(() => isClearGlass(config.value.glassTint), sync, { immediate: true })
   watch(hasBackground, () => {
     stop()
     sync()

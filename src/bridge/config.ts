@@ -3,7 +3,9 @@ import { invoke } from '@tauri-apps/api/core'
 export interface DetectedRuntimeFiles {
   baseDir: string
   singboxPath?: string
+  coreInstallPath?: string
   configPath?: string
+  rulesDir?: string
   found: boolean
 }
 
@@ -13,6 +15,18 @@ export async function readSingboxConfig(path: string): Promise<string> {
 
 export async function writeSingboxConfig(path: string, content: string): Promise<void> {
   return invoke('write_config', { path, content })
+}
+
+export async function replaceConfig(path: string, content: string): Promise<boolean> {
+  return invoke<boolean>('replace_config', { path, content })
+}
+
+export async function restoreConfigBackup(path: string): Promise<void> {
+  return invoke('restore_config_backup', { path })
+}
+
+export async function hasConfigBackup(path: string): Promise<boolean> {
+  return invoke<boolean>('has_config_backup', { path })
 }
 
 export async function validateSingboxConfig(
@@ -60,12 +74,17 @@ export async function deleteFile(path: string): Promise<void> {
   return invoke('delete_file', { path })
 }
 
-export async function copyToRunningConfig(sourcePath: string): Promise<string> {
-  return invoke<string>('copy_to_running_config', { sourcePath })
+export interface RunningConfigCopy {
+  path: string
+  changed: boolean
 }
 
-export async function fetchUrl(url: string): Promise<string> {
-  return invoke<string>('fetch_url', { url })
+export async function copyToRunningConfig(sourcePath: string): Promise<RunningConfigCopy> {
+  return invoke<RunningConfigCopy>('copy_to_running_config', { sourcePath })
+}
+
+export async function fetchUrl(url: string, userAgent?: string): Promise<string> {
+  return invoke<string>('fetch_url', { url, userAgent })
 }
 
 export async function srsListProvider(

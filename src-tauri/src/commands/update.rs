@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -6,16 +6,17 @@ use sha2::{Digest, Sha256};
 use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
 
-use crate::service::scm;
+#[cfg_attr(windows, path = "update/windows.rs")]
+#[cfg_attr(target_os = "android", path = "update/android.rs")]
+pub mod platform;
 
 /// 防止并发执行更新
 pub(crate) static UPDATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) const CORE_PROGRESS_EVENT: &str = "core-update-progress";
 
-const CORE_EXE_NAME: &str = "sing-box.exe";
 /// 一致性校验阶段解压结果的清单，供随后的安装复用（同一资产不下载两次）
-const STAGED_MANIFEST: &str = "staged.json";
+pub(crate) const STAGED_MANIFEST: &str = "staged.json";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -23,6 +24,8 @@ pub enum CoreAssetFormat {
     #[default]
     Zip,
     Exe,
+    #[serde(rename = "tar.gz")]
+    TarGz,
 }
 
 #[derive(Serialize, Clone)]
@@ -42,8 +45,8 @@ pub struct CoreUpdateInfo {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoreUpdateResult {
-    version: String,
-    restarted: bool,
+    pub(crate) version: String,
+    pub(crate) restarted: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -54,19 +57,76 @@ pub(crate) struct UpdateProgress {
     total: u64,
 }
 
+pub(crate) fn validate_panel_asset_url(
+    asset_url: &str,
+    panel_repo: &str,
+    asset_name: &str,
+) -> Result<(), String> {
+    let url = reqwest::Url::parse(asset_url).map_err(|_| "面板下载地址无效".to_string())?;
+    let (owner, repo) = panel_repo
+        .split_once('/')
+        .ok_or_else(|| "面板更新仓库配置无效".to_string())?;
+    let segments: Vec<_> = url
+        .path_segments()
+        .ok_or_else(|| "面板下载地址无效".to_string())?
+        .collect();
+    let trusted = url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && segments.len() == 6
+        && segments[0].eq_ignore_ascii_case(owner)
+        && segments[1].eq_ignore_ascii_case(repo)
+        && segments[2] == "releases"
+        && segments[3] == "download"
+        && !segments[4].is_empty()
+        && segments[5].eq_ignore_ascii_case(asset_name);
+
+    if trusted {
+        Ok(())
+    } else {
+        Err("面板下载地址不属于受信任的发布源".into())
+    }
+}
+
+pub(crate) fn validate_panel_update_asset(
+    repo: &str,
+    trusted_asset: &GhAsset,
+    asset_url: &str,
+    asset_api_url: Option<&str>,
+    asset_size: u64,
+    asset_digest: &str,
+) -> Result<(), String> {
+    validate_panel_asset_url(asset_url, repo, &trusted_asset.name)?;
+    core_asset_hash(asset_digest)
+        .map_err(|_| "该版本缺少有效的 SHA-256 校验信息，已中止面板更新".to_string())?;
+    if trusted_asset.browser_download_url != asset_url
+        || trusted_asset.size != asset_size
+        || trusted_asset.digest.as_deref().unwrap_or_default() != asset_digest
+        || asset_api_url.is_some_and(|url| url != trusted_asset.url)
+    {
+        return Err("最新发布已发生变化，请重新检查更新".into());
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StagedCore {
-    asset_url: String,
-    asset_size: u64,
-    asset_digest: String,
+pub(crate) struct StagedCore {
+    pub(crate) asset_url: String,
+    pub(crate) asset_size: u64,
+    pub(crate) asset_digest: String,
     #[serde(default)]
-    asset_format: CoreAssetFormat,
+    pub(crate) asset_format: CoreAssetFormat,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct GhAsset {
     pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) url: String,
     pub(crate) browser_download_url: String,
     pub(crate) size: u64,
     #[serde(default)]
@@ -99,33 +159,7 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     }
 }
 
-fn windows_asset_pattern(
-    asset_format: CoreAssetFormat,
-    arch: &str,
-) -> Result<&'static str, String> {
-    match (asset_format, arch) {
-        (CoreAssetFormat::Zip, "x86_64") => Ok("windows-amd64.zip"),
-        (CoreAssetFormat::Zip, "aarch64") => Ok("windows-arm64.zip"),
-        (CoreAssetFormat::Exe, "x86_64") => Ok("sing-box_windows_amd64.exe"),
-        (CoreAssetFormat::Exe, "aarch64") => Ok("sing-box_windows_arm64.exe"),
-        (_, other) => Err(format!("不支持的 CPU 架构: {}", other)),
-    }
-}
-
-fn downloaded_asset_path(staging: &Path, asset_format: CoreAssetFormat) -> PathBuf {
-    staging.join(match asset_format {
-        CoreAssetFormat::Zip => "core.zip",
-        CoreAssetFormat::Exe => "core.exe",
-    })
-}
-
-/// 下载与解压产物放在 %TEMP%\singboard（整个目录由核心更新独占，会被清空重建）。
-/// 校验与安装共用它，安装才能复用校验解压出来的文件
-fn staging_dir() -> PathBuf {
-    std::env::temp_dir().join("singboard")
-}
-
-fn core_asset_hash(asset_digest: &str) -> Result<&str, String> {
+pub(crate) fn core_asset_hash(asset_digest: &str) -> Result<&str, String> {
     asset_digest
         .trim()
         .strip_prefix("sha256:")
@@ -134,31 +168,39 @@ fn core_asset_hash(asset_digest: &str) -> Result<&str, String> {
         .ok_or_else(|| "上游未提供有效的 SHA-256 校验信息，已中止核心更新".to_string())
 }
 
-fn take_staged(
+pub(crate) fn verify_archive(archive: &Path, asset_digest: &str) -> Result<Vec<u8>, String> {
+    let expected = core_asset_hash(asset_digest)?;
+    let bytes = std::fs::read(archive).map_err(|e| format!("打开压缩包失败: {}", e))?;
+    if !format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(expected) {
+        return Err("核心文件 SHA-256 校验失败，已中止更新".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn staged_matches(
     staging: &Path,
     asset_url: &str,
     asset_size: u64,
     asset_digest: &str,
     asset_format: CoreAssetFormat,
-) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(staging.join(STAGED_MANIFEST)).ok()?;
-    let staged: StagedCore = serde_json::from_str(&text).ok()?;
-    if staged.asset_url != asset_url
-        || staged.asset_size != asset_size
-        || staged.asset_format != asset_format
-        || !core_asset_hash(&staged.asset_digest)
-            .ok()?
-            .eq_ignore_ascii_case(core_asset_hash(asset_digest).ok()?)
-    {
-        return None;
-    }
-    prepare_core_files(
-        &downloaded_asset_path(staging, asset_format),
-        &staging.join("files"),
-        asset_digest,
-        asset_format,
-    )
-    .ok()
+) -> bool {
+    let Ok(text) = std::fs::read_to_string(staging.join(STAGED_MANIFEST)) else {
+        return false;
+    };
+    let Ok(staged) = serde_json::from_str::<StagedCore>(&text) else {
+        return false;
+    };
+    let same_digest = match (
+        core_asset_hash(&staged.asset_digest),
+        core_asset_hash(asset_digest),
+    ) {
+        (Ok(a), Ok(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    staged.asset_url == asset_url
+        && staged.asset_size == asset_size
+        && same_digest
+        && staged.asset_format == asset_format
 }
 
 pub(crate) fn emit_progress(
@@ -186,18 +228,35 @@ pub(crate) fn apply_mirror(mirror: &Option<String>, url: &str) -> String {
     }
 }
 
-pub(crate) async fn github_get(url: &str) -> Result<reqwest::Response, String> {
+const GITHUB_API: &str = "https://api.github.com/";
+const INVALID_TOKEN: &str = "GitHub Token 无效或已过期 (401)";
+
+pub(crate) fn github_token(token: Option<&str>) -> Option<&str> {
+    token.map(str::trim).filter(|token| !token.is_empty())
+}
+
+pub(crate) async fn github_get_with_token(
+    url: &str,
+    token: Option<&str>,
+) -> Result<reqwest::Response, String> {
     let client = super::network::build_client(Some(Duration::from_secs(30)))
         .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-    let resp = client
+    let mut request = client
         .get(url)
         .header("User-Agent", "singboard")
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = github_token(token).filter(|_| url.starts_with(GITHUB_API)) {
+        request = request.bearer_auth(token);
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("请求 GitHub API 失败: {}", e))?;
 
     let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(INVALID_TOKEN.into());
+    }
     if status == reqwest::StatusCode::FORBIDDEN {
         let body = resp.text().await.unwrap_or_default();
         if body.contains("rate limit") {
@@ -214,22 +273,32 @@ pub(crate) async fn github_get(url: &str) -> Result<reqwest::Response, String> {
     Ok(resp)
 }
 
-fn pick_windows_asset(
-    release: &GhRelease,
-    suffix: &str,
-    asset_format: CoreAssetFormat,
-) -> Result<CoreUpdateInfo, String> {
-    let asset = release
-        .assets
+fn asset_label(suffix: &str) -> &str {
+    let suffix = suffix.trim_start_matches('-');
+    suffix
+        .strip_suffix(".tar.gz")
+        .or_else(|| suffix.strip_suffix(".zip"))
+        .unwrap_or(suffix)
+}
+
+fn pick_asset(release: &GhRelease, suffixes: &[String]) -> Result<CoreUpdateInfo, String> {
+    let asset = suffixes
         .iter()
-        .find(|a| match asset_format {
-            CoreAssetFormat::Zip => a.name.ends_with(suffix),
-            CoreAssetFormat::Exe => a.name == suffix,
+        .find_map(|suffix| {
+            release.assets.iter().find(|a| {
+                if suffix.ends_with(".exe") {
+                    a.name == *suffix
+                } else {
+                    a.name.ends_with(suffix.as_str())
+                }
+            })
         })
         .ok_or_else(|| {
+            let labels: Vec<&str> = suffixes.iter().map(|s| asset_label(s)).collect();
             format!(
-                "该版本未提供适用于 {} 的资产",
-                suffix.trim_end_matches(".zip")
+                "{} 未提供适用于 {} 的资产",
+                release.tag_name,
+                labels.join(" / ")
             )
         })?;
     Ok(CoreUpdateInfo {
@@ -240,30 +309,41 @@ fn pick_windows_asset(
         asset_url: asset.browser_download_url.clone(),
         asset_size: asset.size,
         asset_digest: asset.digest.clone().unwrap_or_default(),
-        asset_format,
+        asset_format: if asset.name.ends_with(".exe") {
+            CoreAssetFormat::Exe
+        } else if asset.name.ends_with(".tar.gz") {
+            CoreAssetFormat::TarGz
+        } else {
+            CoreAssetFormat::Zip
+        },
     })
 }
 
 fn newest_release(releases: Vec<GhRelease>) -> Option<GhRelease> {
-    releases.into_iter().filter(|r| !r.draft).rev().max_by_key(|r| {
-        (
-            super::self_update::parse_version(&r.tag_name),
-            !r.prerelease,
-            r.published_at.clone().unwrap_or_default(),
-        )
-    })
+    releases
+        .into_iter()
+        .filter(|r| !r.draft)
+        .rev()
+        .max_by_key(|r| {
+            (
+                parse_version(&r.tag_name),
+                !r.prerelease,
+                r.published_at.clone().unwrap_or_default(),
+            )
+        })
 }
 
 #[tauri::command]
 pub async fn check_core_update(
     repo: String,
     channel: String,
+    github_token: Option<String>,
     asset_format: Option<CoreAssetFormat>,
 ) -> Result<CoreUpdateInfo, String> {
     let repo = repo.trim().to_string();
     validate_repo(&repo)?;
-    let asset_format = asset_format.unwrap_or_default();
-    let suffix = windows_asset_pattern(asset_format, std::env::consts::ARCH)?;
+    let suffixes = platform::asset_suffixes(asset_format)?;
+    let token = github_token.as_deref();
 
     let release = if channel == "testing" || channel == "latest" {
         let per_page = if channel == "latest" { 100 } else { 10 };
@@ -271,7 +351,7 @@ pub async fn check_core_update(
             "https://api.github.com/repos/{}/releases?per_page={}",
             repo, per_page
         );
-        let releases: Vec<GhRelease> = github_get(&url)
+        let releases: Vec<GhRelease> = github_get_with_token(&url, token)
             .await?
             .json()
             .await
@@ -279,14 +359,34 @@ pub async fn check_core_update(
         newest_release(releases).ok_or("该仓库暂无发布版本")?
     } else {
         let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-        github_get(&url)
+        github_get_with_token(&url, token)
             .await?
             .json()
             .await
             .map_err(|e| format!("解析 GitHub API 响应失败: {}", e))?
     };
 
-    pick_windows_asset(&release, suffix, asset_format)
+    pick_asset(&release, &suffixes)
+}
+
+pub(crate) fn panel_download_urls(
+    mirror: &Option<String>,
+    repo: &str,
+    asset_url: &str,
+    api_url: Option<&str>,
+    prefer_api: bool,
+) -> Vec<String> {
+    let direct = apply_mirror(mirror, asset_url);
+    let prefix = format!("{}repos/{}/releases/assets/", GITHUB_API, repo);
+    let api = api_url.map(str::trim).filter(|url| {
+        url.strip_prefix(&prefix)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    });
+    match api {
+        Some(api) if prefer_api => vec![api.to_string(), direct],
+        Some(api) => vec![direct, api.to_string()],
+        None => vec![direct],
+    }
 }
 
 pub(crate) async fn download_asset(
@@ -296,15 +396,56 @@ pub(crate) async fn download_asset(
     expected_size: u64,
     dest: &Path,
 ) -> Result<(), String> {
+    download_asset_from(app, event, &[url.to_string()], None, expected_size, dest).await
+}
+
+pub(crate) async fn download_asset_from(
+    app: &tauri::AppHandle,
+    event: &str,
+    urls: &[String],
+    token: Option<&str>,
+    expected_size: u64,
+    dest: &Path,
+) -> Result<(), String> {
     // 下载不设总超时（大文件慢速网络下会中途截断），连接问题由系统层面报错
     let client =
         super::network::build_client(None).map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
-    let mut resp = client
-        .get(url)
-        .header("User-Agent", "singboard")
+    let mut first_error = None;
+    for url in urls {
+        match fetch_to_file(app, event, &client, url, token, expected_size, dest).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| "没有可用的下载地址".to_string()))
+}
+
+async fn fetch_to_file(
+    app: &tauri::AppHandle,
+    event: &str,
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    expected_size: u64,
+    dest: &Path,
+) -> Result<(), String> {
+    let api = url.starts_with(GITHUB_API);
+    let mut request = client.get(url).header("User-Agent", "singboard");
+    if api {
+        request = request.header("Accept", "application/octet-stream");
+        if let Some(token) = github_token(token) {
+            request = request.bearer_auth(token);
+        }
+    }
+    let mut resp = request
         .send()
         .await
         .map_err(|e| format!("下载失败: {}", e))?;
+    if api && resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(INVALID_TOKEN.into());
+    }
     if !resp.status().is_success() {
         return Err(format!("下载失败: HTTP {}", resp.status()));
     }
@@ -341,474 +482,259 @@ pub(crate) async fn download_asset(
     Ok(())
 }
 
-/// 从 zip 中解出 sing-box.exe（必需）与随附的 dll 依赖（如 naive 需要的
-/// libcronet.dll）。按文件名匹配、平铺写入 staging，不依赖目录结构。
-/// 返回解出的 dll 文件名列表。
-fn extract_core_files(
-    zip_path: &Path,
-    staging: &Path,
+pub(crate) fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    let text = text.trim().trim_start_matches(['v', 'V']);
+    let mut parts = text.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch_raw = parts.next().unwrap_or("0");
+    let digits: String = patch_raw.chars().take_while(char::is_ascii_digit).collect();
+    let patch = digits.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+pub(crate) fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => latest.trim().trim_start_matches(['v', 'V']) != current.trim(),
+    }
+}
+
+pub(crate) fn digest_hash(asset_digest: &str) -> Option<&str> {
+    asset_digest
+        .trim()
+        .strip_prefix("sha256:")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
+    let content = std::fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
+    Ok(format!("{:x}", Sha256::digest(&content)))
+}
+
+pub(crate) fn verify_digest(
+    file: &Path,
     asset_digest: &str,
-) -> Result<Vec<String>, String> {
-    let expected = core_asset_hash(asset_digest)?;
-    let bytes = std::fs::read(zip_path).map_err(|e| format!("打开压缩包失败: {}", e))?;
-    if !format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(expected) {
-        return Err("核心文件 SHA-256 校验失败，已中止更新".into());
-    }
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
-        .map_err(|e| format!("读取压缩包失败: {}", e))?;
-    if staging.exists() {
-        std::fs::remove_dir_all(staging).map_err(|e| format!("清理临时目录失败: {}", e))?;
-    }
-    std::fs::create_dir_all(staging).map_err(|e| format!("创建临时目录失败: {}", e))?;
-
-    let mut found_exe = false;
-    let mut dlls: Vec<String> = Vec::new();
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("读取压缩包失败: {}", e))?;
-        if entry.is_dir() {
-            continue;
+    mirror: &Option<String>,
+) -> Result<(), String> {
+    let Some(expected) = digest_hash(asset_digest) else {
+        let mirrored = mirror
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|m| !m.is_empty());
+        if mirrored {
+            return Err("该版本缺少校验信息，已中止更新".into());
         }
-        // 只取文件名部分，天然免疫 zip 路径穿越
-        let Some(name) = entry.name().rsplit(['/', '\\']).next().map(str::to_string) else {
-            continue;
-        };
-        let dest = if name.eq_ignore_ascii_case(CORE_EXE_NAME) {
-            found_exe = true;
-            staging.join(CORE_EXE_NAME)
-        } else if name.to_ascii_lowercase().ends_with(".dll") {
-            dlls.push(name.clone());
-            staging.join(&name)
-        } else {
-            continue;
-        };
-        let mut out =
-            std::fs::File::create(&dest).map_err(|e| format!("写入临时文件失败: {}", e))?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| format!("解压失败: {}", e))?;
-    }
-
-    if !found_exe {
-        return Err(format!("压缩包内未找到 {}", CORE_EXE_NAME));
-    }
-    Ok(dlls)
-}
-
-/// ZIP 和独立 EXE 都先校验发布资产，再重新生成隔离的安装文件目录。
-fn prepare_core_files(
-    asset_path: &Path,
-    files_dir: &Path,
-    asset_digest: &str,
-    asset_format: CoreAssetFormat,
-) -> Result<Vec<String>, String> {
-    if asset_format == CoreAssetFormat::Zip {
-        return extract_core_files(asset_path, files_dir, asset_digest);
-    }
-    let expected = core_asset_hash(asset_digest)?;
-    let bytes = std::fs::read(asset_path).map_err(|e| format!("读取核心失败: {}", e))?;
-    if !format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(expected) {
-        return Err("核心文件 SHA-256 校验失败，已中止更新".into());
-    }
-    if files_dir.exists() {
-        std::fs::remove_dir_all(files_dir).map_err(|e| format!("清理临时目录失败: {}", e))?;
-    }
-    std::fs::create_dir_all(files_dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
-    std::fs::write(files_dir.join(CORE_EXE_NAME), bytes)
-        .map_err(|e| format!("写入临时文件失败: {}", e))?;
-    Ok(Vec::new())
-}
-
-/// 对下载的核心跑一次 `version`，确认能运行并取版本串
-async fn probe_core_version(exe: &Path) -> Result<String, String> {
-    let output = tokio::process::Command::new(exe)
-        .args(["version"])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()
-        .await
-        .map_err(|e| format!("下载的核心无法运行: {}", e))?;
-    if !output.status.success() {
-        return Err("下载的核心无法运行（version 命令执行失败）".into());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().next().unwrap_or("unknown").to_string())
-}
-
-/// 服务刚停止时文件锁释放有延迟，重试几次（同 helper::deploy_helper）
-pub(crate) fn retry_io<F: FnMut() -> std::io::Result<()>>(
-    attempts: u32,
-    mut f: F,
-) -> std::io::Result<()> {
-    let mut last_err = None;
-    for attempt in 0..attempts.max(1) {
-        if attempt > 0 {
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        match f() {
-            Ok(()) => return Ok(()),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(last_err.unwrap())
-}
-
-/// 停服务 → 备份旧核心（只留一份 .bak）→ 替换 exe 并覆盖随附 dll → 重启，
-/// 失败自动回滚（dll 按需求不备份，直接覆盖）
-pub(crate) fn swap_and_restart(
-    progress: &impl Fn(&str),
-    files: &[(String, Vec<u8>)],
-    target: &Path,
-    service_name: &str,
-) -> Result<bool, String> {
-    let exe_bytes = &files
-        .iter()
-        .find(|(name, _)| name == CORE_EXE_NAME)
-        .ok_or("更新清单缺少 sing-box.exe")?
-        .1;
-    let target_dir = target.parent().ok_or("sing-box 路径无效")?;
-    let new_path = target.with_extension("exe.new");
-    let bak_path = target.with_extension("exe.bak");
-
-    // 先落到目标同卷，后续 rename 才是原子操作
-    std::fs::write(&new_path, exe_bytes).map_err(|e| format!("复制新核心失败: {}", e))?;
-    let cleanup_new = || {
-        let _ = std::fs::remove_file(&new_path);
+        return Ok(());
     };
 
-    let was_running = match scm::query_service_status(service_name) {
-        Ok(status) => status.state == "running" || status.state == "starting",
-        Err(e) => {
-            cleanup_new();
-            return Err(e);
-        }
-    };
-
-    if was_running {
-        progress("replace");
-        if let Err(e) = scm::stop_service(service_name) {
-            cleanup_new();
-            return Err(format!("停止服务失败: {}", e));
-        }
+    let actual = sha256_file(file)?;
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
     } else {
-        progress("replace");
+        Err("文件校验失败，已中止更新".into())
     }
-
-    // 备份：旧核心存在才做；只保留一份备份
-    let had_old = target.exists();
-    if had_old {
-        let _ = std::fs::remove_file(&bak_path);
-        if let Err(e) = retry_io(3, || std::fs::rename(target, &bak_path)) {
-            cleanup_new();
-            if was_running {
-                let _ = scm::start_service(service_name);
-            }
-            return Err(format!("备份旧核心失败: {}", e));
-        }
-    }
-
-    if let Err(e) = std::fs::rename(&new_path, target) {
-        // 还原备份
-        if had_old {
-            let _ = std::fs::rename(&bak_path, target);
-        }
-        cleanup_new();
-        if was_running {
-            let _ = scm::start_service(service_name);
-        }
-        return Err(format!("替换核心失败: {}", e));
-    }
-
-    // 覆盖随附 dll（如 naive 依赖的 libcronet.dll）：不备份，直接覆盖。
-    // 失败则回滚 exe，避免 exe 与 dll 版本不一致
-    for (dll, bytes) in files.iter().filter(|(name, _)| name != CORE_EXE_NAME) {
-        let dll_dest = target_dir.join(dll);
-        if let Err(e) = retry_io(3, || std::fs::write(&dll_dest, bytes)) {
-            if had_old {
-                let _ = retry_io(3, || {
-                    std::fs::remove_file(target)?;
-                    std::fs::rename(&bak_path, target)
-                });
-            }
-            if was_running {
-                let _ = scm::start_service(service_name);
-            }
-            return Err(format!("更新 {} 失败: {}", dll, e));
-        }
-    }
-
-    if was_running {
-        progress("restart");
-        let start_result = scm::start_service(service_name).and_then(|_| {
-            std::thread::sleep(Duration::from_secs(2));
-            match scm::query_service_status(service_name) {
-                Ok(status) if status.state == "running" => Ok(()),
-                Ok(status) => Err(format!("服务未能保持运行（状态: {}）", status.state)),
-                Err(e) => Err(e),
-            }
-        });
-        if let Err(e) = start_result {
-            // 回滚到旧核心（copy 保留 .bak）
-            let _ = scm::stop_service(service_name);
-            let rollback = if had_old {
-                retry_io(3, || std::fs::copy(&bak_path, target).map(|_| ()))
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| scm::start_service(service_name))
-            } else {
-                Err("无可用备份".into())
-            };
-            return match rollback {
-                Ok(()) => Err(format!("新核心启动失败，已回滚到旧版本。原因: {}", e)),
-                Err(re) => Err(format!("新核心启动失败: {}；回滚也失败: {}", e, re)),
-            };
-        }
-    }
-
-    Ok(was_running)
 }
 
-/// 下载资产并解压，返回其中 sing-box.exe 的 SHA-256。
-/// 用于版本号相同时比对本地核心与上游资产是否一致（缓存未命中时调用）
-#[tauri::command]
-pub async fn probe_asset_exe_hash(
-    app: tauri::AppHandle,
-    asset_url: String,
-    asset_size: u64,
-    asset_digest: String,
-    asset_format: Option<CoreAssetFormat>,
-    mirror: Option<String>,
-) -> Result<String, String> {
-    let asset_format = asset_format.unwrap_or_default();
-    core_asset_hash(&asset_digest)?;
-    let _guard = UPDATE_LOCK
-        .try_lock()
-        .map_err(|_| "更新正在进行中".to_string())?;
+fn is_release_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+'))
+}
 
-    let staging = staging_dir();
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| format!("创建临时目录失败: {}", e))?;
-    let cleanup = |msg: String| {
-        let _ = std::fs::remove_dir_all(&staging);
-        msg
+pub fn is_release_page_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return false;
     };
-
-    let download_url = apply_mirror(&mirror, &asset_url);
-    let zip_path = downloaded_asset_path(&staging, asset_format);
-    download_asset(
-        &app,
-        CORE_PROGRESS_EVENT,
-        &download_url,
-        asset_size,
-        &zip_path,
-    )
-    .await
-    .map_err(cleanup)?;
-
-    emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
-    // 解压结果与清单留在 staging：用户确认重新安装时直接取用，不再下载一遍
-    let hash = {
-        let staging = staging.clone();
-        let asset_url = asset_url.clone();
-        tokio::task::spawn_blocking(move || {
-            let files_dir = staging.join("files");
-            prepare_core_files(&zip_path, &files_dir, &asset_digest, asset_format)?;
-            let exe_hash = crate::service::helper::sha256_file(&files_dir.join(CORE_EXE_NAME))?;
-            let manifest = serde_json::to_string(&StagedCore {
-                asset_url,
-                asset_size,
-                asset_digest,
-                asset_format,
-            })
-            .map_err(|e| format!("写入清单失败: {}", e))?;
-            std::fs::write(staging.join(STAGED_MANIFEST), manifest)
-                .map_err(|e| format!("写入清单失败: {}", e))?;
-            Ok::<String, String>(exe_hash)
-        })
-        .await
-        .map_err(|e| format!("任务执行失败: {}", e))
-        .and_then(|r| r)
-        .map_err(cleanup)?
-    };
-
-    Ok(hash)
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts.as_slice() {
+        [owner, repo, "releases"] => is_release_segment(owner) && is_release_segment(repo),
+        [owner, repo, "releases", "tag", tag] => {
+            is_release_segment(owner) && is_release_segment(repo) && is_release_segment(tag)
+        }
+        _ => false,
+    }
 }
 
 #[tauri::command]
-pub async fn perform_core_update(
-    app: tauri::AppHandle,
-    asset_url: String,
-    asset_size: u64,
-    asset_digest: String,
-    asset_format: Option<CoreAssetFormat>,
-    mirror: Option<String>,
-    singbox_path: String,
-) -> Result<CoreUpdateResult, String> {
-    let asset_format = asset_format.unwrap_or_default();
-    core_asset_hash(&asset_digest)?;
-    let service_name = crate::service::component::app_service_name(&app)?;
-    let _guard = UPDATE_LOCK
-        .try_lock()
-        .map_err(|_| "更新正在进行中".to_string())?;
-
-    // 步骤 0：校验目标路径
-    let target = PathBuf::from(singbox_path.trim());
-    if singbox_path.trim().is_empty() {
-        return Err("请先在服务配置中设置 sing-box 路径".into());
+pub fn open_release_page(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !is_release_page_url(&url) {
+        return Err("只能打开 GitHub 发布页".into());
     }
-    if !target.parent().is_some_and(|p| p.is_dir()) {
-        return Err("sing-box 路径所在目录不存在".into());
+    #[cfg(target_os = "android")]
+    return crate::native::open_url(&app, url);
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        std::process::Command::new("explorer")
+            .arg(&url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("无法打开浏览器: {e}"))
     }
-
-    // 临时目录
-    let staging = staging_dir();
-    let cleanup = |msg: String| {
-        let _ = std::fs::remove_dir_all(&staging);
-        msg
-    };
-
-    let files_dir = staging.join("files");
-    let staged_exe = files_dir.join(CORE_EXE_NAME);
-    let reusable = {
-        let staging = staging.clone();
-        let asset_url = asset_url.clone();
-        let asset_digest = asset_digest.clone();
-        tokio::task::spawn_blocking(move || {
-            take_staged(
-                &staging,
-                &asset_url,
-                asset_size,
-                &asset_digest,
-                asset_format,
-            )
-        })
-        .await
-        .map_err(|e| format!("任务执行失败: {}", e))?
-    };
-    let dlls = match reusable {
-        Some(dlls) => dlls,
-        None => {
-            let _ = std::fs::remove_dir_all(&staging);
-            std::fs::create_dir_all(&staging).map_err(|e| format!("创建临时目录失败: {}", e))?;
-
-            let download_url = apply_mirror(&mirror, &asset_url);
-            let zip_path = downloaded_asset_path(&staging, asset_format);
-            download_asset(
-                &app,
-                CORE_PROGRESS_EVENT,
-                &download_url,
-                asset_size,
-                &zip_path,
-            )
-            .await
-            .map_err(cleanup)?;
-
-            emit_progress(&app, CORE_PROGRESS_EVENT, "extract", 0, 0);
-            let files_dir = files_dir.clone();
-            tokio::task::spawn_blocking(move || {
-                prepare_core_files(&zip_path, &files_dir, &asset_digest, asset_format)
-            })
-            .await
-            .map_err(|e| format!("任务执行失败: {}", e))
-            .and_then(|r| r)
-            .map_err(cleanup)?
-        }
-    };
-
-    // 步骤 3：健全性检查（staging 里 dll 就在 exe 旁边，加载依赖不受影响）
-    let version = probe_core_version(&staged_exe).await.map_err(cleanup)?;
-
-    // One consent covers replacement, restart and any rollback.
-    let mut files = Vec::new();
-    for name in std::iter::once("sing-box.exe".to_string()).chain(dlls) {
-        let hash = crate::service::helper::sha256_file(&files_dir.join(&name)).map_err(cleanup)?;
-        files.push((name, hash));
-    }
-    emit_progress(&app, CORE_PROGRESS_EVENT, "replace", 0, 0);
-    let restarted = crate::service::elevation::request(
-        &app,
-        crate::service::elevation::Operation::UpdateCore {
-            service: service_name,
-            staging: files_dir,
-            target,
-            files,
-        },
-    )
-    .await
-    .map_err(cleanup)?
-    .as_bool()
-    .ok_or("更新进程返回了无效结果")?;
-    // 步骤 10：清理
-    let _ = std::fs::remove_dir_all(&staging);
-
-    Ok(CoreUpdateResult { version, restarted })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
-    const ASSET_URL: &str = "https://example.invalid/sing-box.zip";
+    #[test]
+    fn release_page_urls_are_limited_to_github_releases() {
+        assert!(is_release_page_url(
+            "https://github.com/SagerNet/sing-box/releases/tag/v1.13.0-beta.2"
+        ));
+        assert!(is_release_page_url(
+            "https://github.com/Yuu518/singboard/releases"
+        ));
+        assert!(!is_release_page_url(
+            "http://github.com/SagerNet/sing-box/releases"
+        ));
+        assert!(!is_release_page_url(
+            "https://github.com.evil.test/a/b/releases"
+        ));
+        assert!(!is_release_page_url(
+            "https://github.com/a/b/releases/tag/v1&calc"
+        ));
+        assert!(!is_release_page_url(
+            "https://github.com/a/b/releases/tag/.."
+        ));
+        assert!(!is_release_page_url("https://github.com/a/b/issues"));
+        assert!(!is_release_page_url(
+            "https://github.com/a/b/releases/tag/v1/extra"
+        ));
+        assert!(!is_release_page_url(
+            "https://github.com/a/b/releases/tag/v 1"
+        ));
+    }
 
-    struct TestStaging(PathBuf);
+    const ASSET: &str =
+        "https://github.com/Yuu518/singboard/releases/download/v1.0.0/singboard.exe";
+    const API: &str = "https://api.github.com/repos/Yuu518/singboard/releases/assets/726398165";
+    const REPO: &str = "Yuu518/singboard";
 
-    impl TestStaging {
-        fn new() -> Self {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "singboard-core-update-test-{}-{}-{}",
-                std::process::id(),
-                timestamp,
-                NEXT_CASE.fetch_add(1, Ordering::Relaxed),
-            ));
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
+    #[test]
+    fn panel_downloads_try_the_release_link_before_the_api() {
+        assert_eq!(
+            panel_download_urls(&None, REPO, ASSET, Some(API), false),
+            vec![ASSET, API]
+        );
+        assert_eq!(
+            panel_download_urls(&Some("  ".into()), REPO, ASSET, Some(API), false),
+            vec![ASSET, API]
+        );
+    }
+
+    #[test]
+    fn a_github_token_moves_the_api_first() {
+        assert_eq!(
+            panel_download_urls(&None, REPO, ASSET, Some(API), true),
+            vec![API, ASSET]
+        );
+    }
+
+    #[test]
+    fn only_the_release_link_goes_through_the_mirror() {
+        let mirror = Some("https://mirror.example.com/".to_string());
+        let mirrored = format!("https://mirror.example.com/{ASSET}");
+        assert_eq!(
+            panel_download_urls(&mirror, REPO, ASSET, Some(API), false),
+            vec![mirrored.clone(), API.to_string()]
+        );
+        assert_eq!(
+            panel_download_urls(&mirror, REPO, ASSET, Some(API), true),
+            vec![API.to_string(), mirrored]
+        );
+    }
+
+    #[test]
+    fn the_api_fallback_only_accepts_this_repos_asset_endpoint() {
+        for bad in [
+            "",
+            "https://api.github.com/repos/Yuu518/singboard/releases/assets/",
+            "https://api.github.com/repos/Yuu518/singboard/releases/assets/1/../x",
+            "http://api.github.com/repos/Yuu518/singboard/releases/assets/1",
+            "https://api.github.com.evil.test/repos/Yuu518/singboard/releases/assets/1",
+            "https://api.github.com/repos/other/repo/releases/assets/1",
+        ] {
+            assert_eq!(
+                panel_download_urls(&None, REPO, ASSET, Some(bad), true),
+                vec![ASSET],
+                "{bad}"
+            );
         }
+        assert_eq!(
+            panel_download_urls(&None, REPO, ASSET, None, true),
+            vec![ASSET]
+        );
+    }
 
-        fn write_archive(&self, exe: &[u8], dll: &[u8]) -> (u64, String) {
-            let path = self.0.join("core.zip");
-            let file = std::fs::File::create(&path).unwrap();
-            let mut archive = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            archive.start_file("release/sing-box.exe", options).unwrap();
-            archive.write_all(exe).unwrap();
-            archive
-                .start_file("release/libcronet.dll", options)
-                .unwrap();
-            archive.write_all(dll).unwrap();
-            archive.finish().unwrap();
-            (
-                std::fs::metadata(&path).unwrap().len(),
-                format!(
-                    "sha256:{}",
-                    crate::service::helper::sha256_file(&path).unwrap()
+    #[test]
+    fn panel_updates_bind_windows_and_android_packages_to_the_latest_asset() {
+        for name in [
+            "singboard.exe",
+            "singboard-arm64-v8a.apk",
+            "singboard-universal.apk",
+        ] {
+            let asset = GhAsset {
+                name: name.into(),
+                url: API.into(),
+                browser_download_url: format!(
+                    "https://github.com/{REPO}/releases/download/v1.0.0/{name}"
                 ),
-            )
-        }
-
-        fn write_manifest(&self, asset_size: u64, asset_digest: &str) {
-            let manifest = StagedCore {
-                asset_url: ASSET_URL.to_string(),
-                asset_size,
-                asset_digest: asset_digest.to_string(),
-                asset_format: CoreAssetFormat::Zip,
+                size: 1024,
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
             };
-            std::fs::write(
-                self.0.join(STAGED_MANIFEST),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
+            let digest = asset.digest.as_deref().unwrap();
+            let validate = |url: &str, api: Option<&str>, size: u64, hash: &str| {
+                validate_panel_update_asset(REPO, &asset, url, api, size, hash)
+            };
+            assert!(validate(&asset.browser_download_url, Some(API), 1024, digest).is_ok());
+            assert!(validate(&asset.browser_download_url, None, 1024, digest).is_ok());
+            assert!(validate(&asset.browser_download_url, None, 1024, "").is_err());
+            assert!(validate(&asset.browser_download_url, None, 1024, "sha256:abc").is_err());
+            assert!(validate(&asset.browser_download_url, None, 0, digest).is_err());
+            assert!(
+                validate(
+                    &asset.browser_download_url,
+                    Some("https://api.github.com/repos/other/repo/releases/assets/1"),
+                    1024,
+                    digest
+                )
+                .is_err()
+            );
+            let stale = asset.browser_download_url.replace("v1.0.0", "v0.9.0");
+            assert!(validate(&stale, None, 1024, digest).is_err());
+            let changed_digest = format!("sha256:{}", "b".repeat(64));
+            assert!(validate(&asset.browser_download_url, None, 1024, &changed_digest).is_err());
         }
     }
 
-    impl Drop for TestStaging {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
+    #[test]
+    fn panel_package_urls_require_the_configured_repo_and_filename() {
+        let name = "singboard-arm64-v8a.apk";
+        let good = format!("https://github.com/{REPO}/releases/download/v1.0.0/{name}");
+        assert!(validate_panel_asset_url(&good, REPO, name).is_ok());
+        for bad in [
+            good.replace("https:", "http:"),
+            good.replace("github.com", "github.com.evil.test"),
+            good.replace(REPO, "other/repo"),
+            good.replace(name, "singboard.exe"),
+            format!("{good}?download=1"),
+            format!("{good}#asset"),
+        ] {
+            assert!(validate_panel_asset_url(&bad, REPO, name).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn blank_github_tokens_are_ignored() {
+        assert_eq!(github_token(None), None);
+        assert_eq!(github_token(Some("   ")), None);
+        assert_eq!(github_token(Some(" ghp_abc ")), Some("ghp_abc"));
     }
 
     fn release(tag: &str, prerelease: bool, draft: bool, published_at: &str) -> GhRelease {
@@ -821,12 +747,45 @@ mod tests {
         }
     }
 
+    fn release_with(names: &[&str]) -> GhRelease {
+        GhRelease {
+            tag_name: "v1.0.0".into(),
+            prerelease: false,
+            draft: false,
+            published_at: None,
+            assets: names
+                .iter()
+                .map(|name| GhAsset {
+                    name: name.to_string(),
+                    url: String::new(),
+                    browser_download_url: format!("https://example.com/{name}"),
+                    size: 1,
+                    digest: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn suffixes(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn testing_channel_prefers_the_highest_version_over_the_latest_published() {
         let releases = vec![
             release("v1.14.3-reF1nd", false, false, "2026-10-10T00:49:24Z"),
-            release("v1.15.0-alpha.11-reF1nd", true, false, "2026-10-09T15:01:33Z"),
-            release("v1.15.0-alpha.10-reF1nd", true, false, "2026-10-06T00:31:30Z"),
+            release(
+                "v1.15.0-alpha.11-reF1nd",
+                true,
+                false,
+                "2026-10-09T15:01:33Z",
+            ),
+            release(
+                "v1.15.0-alpha.10-reF1nd",
+                true,
+                false,
+                "2026-10-06T00:31:30Z",
+            ),
             release("v1.14.2-reF1nd", false, false, "2026-09-25T19:29:39Z"),
         ];
         assert_eq!(
@@ -865,180 +824,120 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_archive_is_rejected_before_extracting_any_files() {
-        let staging = TestStaging::new();
-        let (size, digest) = staging.write_archive(b"trusted exe", b"trusted dll");
-        let (altered_size, _) = staging.write_archive(b"changed exe", b"changed dll");
-        assert_eq!(size, altered_size);
-        let files = staging.0.join("files");
-
-        let error = extract_core_files(&staging.0.join("core.zip"), &files, &digest).unwrap_err();
-
-        assert!(error.contains("SHA-256"));
-        assert!(!files.exists());
-    }
-
-    #[test]
-    fn cached_executable_and_dlls_are_restored_from_the_verified_archive() {
-        let staging = TestStaging::new();
-        let (size, digest) = staging.write_archive(b"trusted exe", b"trusted dll");
-        staging.write_manifest(size, &digest);
-        let files = staging.0.join("files");
-        std::fs::create_dir(&files).unwrap();
-        std::fs::write(files.join(CORE_EXE_NAME), b"changed exe").unwrap();
-        std::fs::write(files.join("libcronet.dll"), b"changed dll").unwrap();
-        std::fs::write(files.join("untrusted.dll"), b"extra dll").unwrap();
-
-        let dlls = take_staged(&staging.0, ASSET_URL, size, &digest, CoreAssetFormat::Zip).unwrap();
-
-        assert_eq!(dlls, vec!["libcronet.dll"]);
-        assert_eq!(
-            std::fs::read(files.join(CORE_EXE_NAME)).unwrap(),
-            b"trusted exe"
-        );
-        assert_eq!(
-            std::fs::read(files.join("libcronet.dll")).unwrap(),
-            b"trusted dll"
-        );
-        assert!(!files.join("untrusted.dll").exists());
-    }
-
-    #[test]
-    fn a_manifest_cannot_authorize_an_altered_cached_archive() {
-        let staging = TestStaging::new();
-        let (size, digest) = staging.write_archive(b"trusted exe", b"trusted dll");
-        staging.write_archive(b"changed exe", b"changed dll");
-        staging.write_manifest(size, &digest);
-
-        assert!(take_staged(&staging.0, ASSET_URL, size, &digest, CoreAssetFormat::Zip).is_none());
-        assert!(!staging.0.join("files").exists());
-    }
-
-    #[test]
-    fn cached_archive_must_match_the_requested_asset_and_digest() {
-        let staging = TestStaging::new();
-        let (size, digest) = staging.write_archive(b"trusted exe", b"trusted dll");
-        staging.write_manifest(size, &digest);
-
-        assert!(
-            take_staged(
-                &staging.0,
-                "https://example.invalid/other.zip",
-                size,
-                &digest,
-                CoreAssetFormat::Zip,
-            )
-            .is_none()
-        );
-        assert!(
-            take_staged(
-                &staging.0,
-                ASSET_URL,
-                size + 1,
-                &digest,
-                CoreAssetFormat::Zip
-            )
-            .is_none()
-        );
-        assert!(
-            take_staged(
-                &staging.0,
-                ASSET_URL,
-                size,
-                &format!("sha256:{}", "0".repeat(64)),
-                CoreAssetFormat::Zip,
-            )
-            .is_none()
-        );
-        assert!(!staging.0.join("files").exists());
-    }
-
-    #[test]
-    fn legacy_unverified_cache_is_not_reused() {
-        let staging = TestStaging::new();
-        let (size, digest) = staging.write_archive(b"trusted exe", b"trusted dll");
-        let legacy_manifest = serde_json::json!({
-            "assetUrl": ASSET_URL,
-            "assetSize": size,
-            "exeHash": "unverified",
-            "dlls": ["libcronet.dll"],
-        });
-        std::fs::write(
-            staging.0.join(STAGED_MANIFEST),
-            serde_json::to_vec(&legacy_manifest).unwrap(),
-        )
-        .unwrap();
-
-        assert!(take_staged(&staging.0, ASSET_URL, size, &digest, CoreAssetFormat::Zip).is_none());
-        assert!(!staging.0.join("files").exists());
-    }
-
-    #[test]
-    fn personal_asset_names_match_architecture_and_release() {
-        assert_eq!(
-            windows_asset_pattern(CoreAssetFormat::Exe, "x86_64").unwrap(),
-            "sing-box_windows_amd64.exe"
-        );
-        assert_eq!(
-            windows_asset_pattern(CoreAssetFormat::Exe, "aarch64").unwrap(),
-            "sing-box_windows_arm64.exe"
-        );
-        let release = GhRelease {
-            tag_name: "v1.14.0-beta.13".into(),
-            prerelease: true,
-            draft: false,
-            published_at: None,
-            assets: vec![GhAsset {
-                name: "sing-box_windows_amd64.exe".into(),
-                browser_download_url: "https://example.invalid/core.exe".into(),
-                size: 123,
-                digest: None,
-            }],
-        };
-        let info = pick_windows_asset(&release, "sing-box_windows_amd64.exe", CoreAssetFormat::Exe)
+    fn picks_windows_asset_by_exact_suffix() {
+        let release = release_with(&[
+            "sing-box-1.0.0-windows-amd64v3.zip",
+            "sing-box-1.0.0-windows-amd64.zip",
+            "sing-box-1.0.0-windows-arm64.zip",
+        ]);
+        let picked = pick_asset(&release, &suffixes(&["windows-amd64.zip"])).unwrap();
+        assert_eq!(picked.asset_name, "sing-box-1.0.0-windows-amd64.zip");
+        let error = pick_asset(&release, &suffixes(&["windows-386.zip"]))
+            .err()
             .unwrap();
-        assert_eq!(info.asset_format, CoreAssetFormat::Exe);
-        assert!(pick_windows_asset(&release, "windows-amd64.zip", CoreAssetFormat::Zip).is_err());
+        assert_eq!(error, "v1.0.0 未提供适用于 windows-386 的资产");
     }
 
     #[test]
-    fn cached_exe_is_verified_and_restores_only_trusted_files() {
-        let staging = TestStaging::new();
-        let path = downloaded_asset_path(&staging.0, CoreAssetFormat::Exe);
-        std::fs::write(&path, b"trusted exe").unwrap();
-        let digest = format!(
-            "sha256:{}",
-            crate::service::helper::sha256_file(&path).unwrap()
-        );
-        let manifest = StagedCore {
-            asset_url: ASSET_URL.into(),
-            asset_size: 11,
-            asset_digest: digest.clone(),
-            asset_format: CoreAssetFormat::Exe,
+    fn picks_personal_exe_by_exact_name_and_reports_its_format() {
+        let release = release_with(&[
+            "prefix-sing-box_windows_amd64.exe",
+            "sing-box_windows_amd64.exe",
+            "sing-box_windows_arm64.exe",
+        ]);
+        let info = pick_asset(&release, &suffixes(&["sing-box_windows_amd64.exe"])).unwrap();
+        assert_eq!(info.asset_name, "sing-box_windows_amd64.exe");
+        assert_eq!(info.asset_format, CoreAssetFormat::Exe);
+        let wrong = release_with(&["prefix-sing-box_windows_amd64.exe"]);
+        assert!(pick_asset(&wrong, &suffixes(&["sing-box_windows_amd64.exe"])).is_err());
+    }
+
+    #[test]
+    fn picks_android_asset_by_go_or_abi_arch_name() {
+        let go_style = release_with(&[
+            "sing-box-1.0.0-android-arm.tar.gz",
+            "sing-box-1.0.0-android-arm64.tar.gz",
+            "sing-box-1.0.0-android-amd64v3.tar.gz",
+            "sing-box-1.0.0-android-amd64.tar.gz",
+        ]);
+        let abi_style = release_with(&[
+            "sing-box-1.0.0-Yuu-android-armeabi-v7a.tar.gz",
+            "sing-box-1.0.0-Yuu-android-arm64-v8a.tar.gz",
+        ]);
+        let arm64 = suffixes(&["-android-arm64.tar.gz", "-android-arm64-v8a.tar.gz"]);
+        let arm = suffixes(&[
+            "-android-arm.tar.gz",
+            "-android-armv7.tar.gz",
+            "-android-armeabi-v7a.tar.gz",
+        ]);
+        let amd64 = suffixes(&["-android-amd64.tar.gz", "-android-x86_64.tar.gz"]);
+
+        let pick = |release: &GhRelease, suffixes: &[String]| {
+            pick_asset(release, suffixes).map(|info| info.asset_name)
         };
-        std::fs::write(
-            staging.0.join(STAGED_MANIFEST),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        let files = staging.0.join("files");
-        std::fs::create_dir(&files).unwrap();
-        std::fs::write(files.join(CORE_EXE_NAME), b"changed exe").unwrap();
-        std::fs::write(files.join("untrusted.dll"), b"extra dll").unwrap();
-        assert!(take_staged(&staging.0, ASSET_URL, 11, &digest, CoreAssetFormat::Zip).is_none());
         assert_eq!(
-            take_staged(&staging.0, ASSET_URL, 11, &digest, CoreAssetFormat::Exe).unwrap(),
-            Vec::<String>::new()
+            pick(&go_style, &arm64).unwrap(),
+            "sing-box-1.0.0-android-arm64.tar.gz"
         );
         assert_eq!(
-            std::fs::read(files.join(CORE_EXE_NAME)).unwrap(),
-            b"trusted exe"
+            pick(&go_style, &arm).unwrap(),
+            "sing-box-1.0.0-android-arm.tar.gz"
         );
-        assert!(!files.join("untrusted.dll").exists());
-        std::fs::remove_dir_all(&files).unwrap();
-        std::fs::write(&path, b"changed exe").unwrap();
-        assert!(take_staged(&staging.0, ASSET_URL, 11, &digest, CoreAssetFormat::Exe).is_none());
-        assert!(!files.exists());
-        assert!(prepare_core_files(&path, &files, "", CoreAssetFormat::Exe).is_err());
+        assert_eq!(
+            pick(&go_style, &amd64).unwrap(),
+            "sing-box-1.0.0-android-amd64.tar.gz"
+        );
+        assert_eq!(
+            pick(&abi_style, &arm64).unwrap(),
+            "sing-box-1.0.0-Yuu-android-arm64-v8a.tar.gz"
+        );
+        assert_eq!(
+            pick(&abi_style, &arm).unwrap(),
+            "sing-box-1.0.0-Yuu-android-armeabi-v7a.tar.gz"
+        );
+        assert_eq!(
+            pick(&abi_style, &amd64).unwrap_err(),
+            "v1.0.0 未提供适用于 android-amd64 / android-x86_64 的资产"
+        );
+    }
+
+    #[test]
+    fn parses_plain_and_prefixed_versions() {
+        assert_eq!(parse_version("3.2.4"), Some((3, 2, 4)));
+        assert_eq!(parse_version("v3.2.4"), Some((3, 2, 4)));
+        assert_eq!(parse_version(" 3.2.4 "), Some((3, 2, 4)));
+        assert_eq!(parse_version("3.2"), Some((3, 2, 0)));
+        assert_eq!(parse_version("3.2.4-beta1"), Some((3, 2, 4)));
+    }
+
+    #[test]
+    fn rejects_unparsable_versions() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("nightly"), None);
+        assert_eq!(parse_version("3"), None);
+    }
+
+    #[test]
+    fn compares_numerically_not_lexically() {
+        assert!(is_newer("3.10.0", "3.2.4"));
+        assert!(is_newer("v3.2.5", "3.2.4"));
+        assert!(is_newer("4.0.0", "3.99.99"));
+        assert!(is_newer("1.10.0", "1.9.9"));
+    }
+
+    #[test]
+    fn same_or_older_is_not_newer() {
+        assert!(!is_newer("3.2.4", "3.2.4"));
+        assert!(!is_newer("v3.2.4", "3.2.4"));
+        assert!(!is_newer("3.2.3", "3.2.4"));
+        assert!(!is_newer("2.9.9", "3.0.0"));
+        assert!(!is_newer("1.0.0-beta", "1.0.0"));
+    }
+
+    #[test]
+    fn unparsable_falls_back_to_string_inequality() {
+        assert!(is_newer("nightly", "3.2.4"));
+        assert!(!is_newer("nightly", "nightly"));
+        assert!(!is_newer("vnightly", "nightly"));
     }
 }

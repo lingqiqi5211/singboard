@@ -1,14 +1,19 @@
 import { ref, computed, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { setRootEnabled } from '@/bridge/app'
+import { IS_ANDROID } from '@/platform'
 import type { AppConfig, ClashApiProfile, ConfigProfile } from '@/types'
+import { applyGlassTint, normalizeGlassTint } from '@/utils/glassTint'
 
 const STORAGE_KEY = 'singboard-config'
+
+export const SERVICE_HOME = '/data/adb/singboard'
 
 function createClashApiId(): string {
   return `api_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
-function createConfigProfileId(): string {
+export function createConfigProfileId(): string {
   return `cfg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
@@ -28,6 +33,7 @@ function normalizeConfig(raw: any): AppConfig {
     if (value.startsWith('\\\\?\\')) return value.slice(4)
     return value
   }
+  const normalizePath = (value: unknown): string => (typeof value === 'string' ? value.trim() : '')
   const normalizeStartupDelay = (value: unknown): number => {
     const delay = typeof value === 'number' ? value : Number(value)
     if (!Number.isFinite(delay)) return 30
@@ -70,12 +76,18 @@ function normalizeConfig(raw: any): AppConfig {
         type: item.type === 'remote' ? 'remote' : 'local',
         source: typeof item.source === 'string' ? normalizeWindowsPath(item.source) : '',
         ...(typeof item.lastUpdated === 'string' ? { lastUpdated: item.lastUpdated } : {}),
-        autoUpdateInterval: typeof item.autoUpdateInterval === 'number' && item.autoUpdateInterval >= 0 ? item.autoUpdateInterval : 0,
+        ...(typeof item.lastFetchError === 'string' && item.lastFetchError ? { lastFetchError: item.lastFetchError } : {}),
+        ...(typeof item.lastFetchFailedAt === 'string' ? { lastFetchFailedAt: item.lastFetchFailedAt } : {}),
+        ...(typeof item.lastLocalChangeAt === 'string' && item.lastLocalChangeAt ? { lastLocalChangeAt: item.lastLocalChangeAt } : {}),
+        ...(typeof item.backupUpdatedAt === 'string' && item.backupUpdatedAt ? { backupUpdatedAt: item.backupUpdatedAt } : {}),
+        autoUpdateInterval: typeof item.autoUpdateInterval === 'number' && item.autoUpdateInterval >= 0
+          ? Math.min(576, Math.round(item.autoUpdateInterval))
+          : 0,
       }))
     : []
 
   // 迁移兼容：旧 configPath 自动创建本地配置
-  const legacyConfigPath = normalizeWindowsPath(raw?.configPath)
+  const legacyConfigPath = IS_ANDROID ? '' : normalizeWindowsPath(raw?.configPath)
   if (configProfiles.length === 0 && legacyConfigPath) {
     configProfiles.push({
       id: createConfigProfileId(),
@@ -88,18 +100,21 @@ function normalizeConfig(raw: any): AppConfig {
 
   const activeConfigProfileId =
     typeof raw?.activeConfigProfileId === 'string'
-    && configProfiles.some((p) => p.id === raw.activeConfigProfileId)
+    && (raw.activeConfigProfileId === '' || configProfiles.some((p) => p.id === raw.activeConfigProfileId))
       ? raw.activeConfigProfileId
       : configProfiles.length > 0 ? configProfiles[0].id : ''
 
   return {
     clashApis,
     activeClashApiId,
-    singboxPath: normalizeWindowsPath(raw?.singboxPath),
-    workingDir: normalizeWindowsPath(raw?.workingDir),
+    singboxPath: IS_ANDROID ? normalizePath(raw?.singboxPath) : normalizeWindowsPath(raw?.singboxPath),
+    coreInstallPath: IS_ANDROID ? normalizePath(raw?.coreInstallPath) : '',
+    configPath: IS_ANDROID ? normalizePath(raw?.configPath) : '',
+    rulesDir: IS_ANDROID ? normalizePath(raw?.rulesDir) : '',
+    workingDir: IS_ANDROID ? normalizePath(raw?.workingDir) : normalizeWindowsPath(raw?.workingDir),
     startupDelaySeconds: normalizeStartupDelay(raw?.startupDelaySeconds),
     theme: ['auto', 'light', 'dark'].includes(raw?.theme) ? raw.theme : 'light',
-    glassMode: raw?.glassMode === 'clear' ? 'clear' : 'blur',
+    glassTint: normalizeGlassTint(raw?.glassTint, raw?.glassMode),
     latencyTestUrl: typeof raw?.latencyTestUrl === 'string' && raw.latencyTestUrl
       ? raw.latencyTestUrl
       : 'https://www.gstatic.com/generate_204',
@@ -112,15 +127,18 @@ function normalizeConfig(raw: any): AppConfig {
     configProfiles,
     activeConfigProfileId,
     closeToTray: typeof raw?.closeToTray === 'boolean' ? raw.closeToTray : false,
-    coreUpdateSource: raw?.coreUpdateSource === 'ref1nd'
-      || raw?.coreUpdateSource === 'lingqiqi'
-      || raw?.coreUpdateSource === 'custom'
+    startPage: typeof raw?.startPage === 'string' ? raw.startPage : '',
+    rootMode: IS_ANDROID && typeof raw?.rootMode === 'boolean' ? raw.rootMode : false,
+    setupCompleted: typeof raw?.setupCompleted === 'boolean' ? raw.setupCompleted : false,
+    pageSwipe: typeof raw?.pageSwipe === 'boolean' ? raw.pageSwipe : false,
+    coreUpdateSource: raw?.coreUpdateSource === 'ref1nd' || raw?.coreUpdateSource === 'lingqiqi' || raw?.coreUpdateSource === 'custom'
       ? raw.coreUpdateSource
       : 'official',
     coreUpdateCustomRepo: typeof raw?.coreUpdateCustomRepo === 'string' ? raw.coreUpdateCustomRepo.trim() : '',
     coreUpdateChannel: raw?.coreUpdateChannel === 'testing' ? 'testing' : 'stable',
     coreUpdateMirror: typeof raw?.coreUpdateMirror === 'string' ? raw.coreUpdateMirror.trim() : '',
     panelAutoCheckUpdate: typeof raw?.panelAutoCheckUpdate === 'boolean' ? raw.panelAutoCheckUpdate : true,
+    githubToken: typeof raw?.githubToken === 'string' ? raw.githubToken.trim() : '',
   }
 }
 
@@ -183,14 +201,10 @@ watch(resolvedTheme, (val) => {
   applyTheme(val)
 })
 
-function applyGlassMode(mode: AppConfig['glassMode']) {
-  document.documentElement.setAttribute('data-glass', mode)
-}
+applyGlassTint(config.value.glassTint)
 
-applyGlassMode(config.value.glassMode)
-
-watch(() => config.value.glassMode, (val) => {
-  applyGlassMode(val)
+watch(() => config.value.glassTint, (val) => {
+  applyGlassTint(val)
 })
 
 watch(config, (val) => {
@@ -201,10 +215,22 @@ watch(config, (val) => {
 }, { deep: true, flush: 'sync' })
 
 // 同步 closeToTray 状态到 Rust 后端
-invoke('set_close_to_tray', { enabled: config.value.closeToTray }).catch(() => {})
-watch(() => config.value.closeToTray, (val) => {
-  invoke('set_close_to_tray', { enabled: val }).catch(() => {})
-})
+if (!IS_ANDROID) {
+  invoke('set_close_to_tray', { enabled: config.value.closeToTray }).catch(() => {})
+  watch(() => config.value.closeToTray, (val) => {
+    invoke('set_close_to_tray', { enabled: val }).catch(() => {})
+  })
+}
+
+export const rootReady: Promise<void> = IS_ANDROID
+  ? setRootEnabled(config.value.rootMode).catch(() => {})
+  : Promise.resolve()
+
+if (IS_ANDROID) {
+  watch(() => config.value.rootMode, (val) => {
+    setRootEnabled(val).catch(() => {})
+  })
+}
 
 export function useConfigStore() {
   const clashApis = computed(() => config.value.clashApis)
@@ -215,6 +241,7 @@ export function useConfigStore() {
   )
   const clashApiUrl = computed(() => activeClashApi.value?.url ?? '')
   const clashApiSecret = computed(() => activeClashApi.value?.secret ?? '')
+  const clashApiEndpoint = computed(() => `${clashApiUrl.value}\n${clashApiSecret.value}`)
 
   const configProfiles = computed(() => config.value.configProfiles)
   const activeConfigProfileId = computed(() => config.value.activeConfigProfileId)
@@ -264,9 +291,9 @@ export function useConfigStore() {
     config.value.activeClashApiId = profile.id
   }
 
-  function addConfigProfile(name: string, type: 'local' | 'remote', source: string, autoUpdateInterval = 0): string {
+  function addConfigProfile(name: string, type: 'local' | 'remote', source: string, autoUpdateInterval = 0, id = createConfigProfileId()): string {
     const profile: ConfigProfile = {
-      id: createConfigProfileId(),
+      id,
       name,
       type,
       source,
@@ -282,9 +309,7 @@ export function useConfigStore() {
     if (index === -1) return false
     config.value.configProfiles.splice(index, 1)
     if (config.value.activeConfigProfileId === id) {
-      config.value.activeConfigProfileId = config.value.configProfiles.length > 0
-        ? config.value.configProfiles[0].id
-        : ''
+      config.value.activeConfigProfileId = ''
     }
     return true
   }
@@ -303,6 +328,21 @@ export function useConfigStore() {
     if (typeof partial.type === 'string') profile.type = partial.type
     if (typeof partial.lastUpdated === 'string') profile.lastUpdated = partial.lastUpdated
     if (typeof partial.autoUpdateInterval === 'number') profile.autoUpdateInterval = partial.autoUpdateInterval
+    for (const key of ['lastLocalChangeAt', 'backupUpdatedAt'] as const) {
+      if (!(key in partial)) continue
+      const value = partial[key]
+      if (value) profile[key] = value
+      else delete profile[key]
+    }
+    if ('lastFetchError' in partial) {
+      if (partial.lastFetchError) {
+        profile.lastFetchError = partial.lastFetchError
+        profile.lastFetchFailedAt = partial.lastFetchFailedAt ?? new Date().toISOString()
+      } else {
+        delete profile.lastFetchError
+        delete profile.lastFetchFailedAt
+      }
+    }
   }
 
   return {
@@ -313,6 +353,7 @@ export function useConfigStore() {
     activeClashApiId,
     clashApiUrl,
     clashApiSecret,
+    clashApiEndpoint,
     configProfiles,
     activeConfigProfileId,
     activeConfigProfile,

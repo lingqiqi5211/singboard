@@ -1,84 +1,128 @@
 <script setup lang="ts">
-import { onMounted, computed } from 'vue'
-import { useOverviewStore } from '@/stores/overview'
+import { computed, onMounted, type ComputedRef } from 'vue'
+import { overviewLinkState, useOverviewStore } from '@/stores/overview'
 import { useConnectionsStore } from '@/stores/connections'
+import { cpuHistory, useServiceStore } from '@/stores/service'
+import { useConfigStore } from '@/stores/config'
+import { useSettledServiceState } from '@/composables/useSettledServiceState'
+import { usePageActive } from '@/android/composables/usePageActive'
+import { IS_ANDROID } from '@/platform'
+import OverviewHero from '@/components/overview/OverviewHero.vue'
+import OverviewStats from '@/components/overview/OverviewStats.vue'
 import NetworkInfo from '@/components/overview/NetworkInfo.vue'
 import TopologyChart from '@/components/overview/TopologyChart.vue'
-import SparkLine from '@/components/overview/SparkLine.vue'
-import { formatBytes, formatSpeed } from '@/utils/format'
+import { networkCounts } from '@/utils/overviewStatus'
 
 const {
-  currentTraffic, memory, uploadSpeedHistory, downloadSpeedHistory, connectionsHistory,
+  currentTraffic, memory, uploadSpeedHistory, downloadSpeedHistory, connectionsHistory, memoryHistory,
+  socketState: trafficSocketState, socketFailures: trafficFailures,
   start: startOverview,
 } = useOverviewStore()
-const { connections, downloadTotal, uploadTotal, start: startConnections } = useConnectionsStore()
+const {
+  connections, downloadTotal, uploadTotal,
+  socketState: connectionsSocketState, socketFailures: connectionsFailures,
+  start: startConnections,
+} = useConnectionsStore()
+const { serviceState, isRunning } = useSettledServiceState()
+const { serviceStatus } = useServiceStore()
+const { config } = useConfigStore()
+const pageActive = usePageActive()
 
-const memoryUsage = computed(() => formatBytes(memory.value.inuse))
+function whileActive<T>(getter: () => T): ComputedRef<T> {
+  let held: { value: T } | null = null
+  return computed(() => {
+    if (pageActive.value || !held) held = { value: getter() }
+    return held.value
+  })
+}
 
-const speedLabelFormatter = (v: number) => (v === 0 ? '' : formatSpeed(v))
-const connLabelFormatter = (v: number) => (v === 0 ? '' : String(Math.round(v)))
+const rootMode = computed(() => IS_ANDROID && config.value.rootMode)
 
-onMounted(async () => {
+const link = computed(() => overviewLinkState(
+  isRunning.value,
+  { state: trafficSocketState.value, failures: trafficFailures.value },
+  { state: connectionsSocketState.value, failures: connectionsFailures.value },
+))
+const linkFailures = computed(() => Math.max(trafficFailures.value, connectionsFailures.value))
+const trafficLive = computed(() => isRunning.value && trafficSocketState.value === 'open')
+const connectionsLive = computed(() => isRunning.value && connectionsSocketState.value === 'open')
+
+const traffic = whileActive(() => (isRunning.value ? currentTraffic.value : null))
+const totals = whileActive(() => (connectionsLive.value ? { up: uploadTotal.value, down: downloadTotal.value } : null))
+const downHistory = whileActive(() => downloadSpeedHistory.value)
+const upHistory = whileActive(() => uploadSpeedHistory.value)
+
+const connectionStats = whileActive(() => {
+  if (!connectionsLive.value) return null
+  const counts = networkCounts(connections.value)
+  return { count: connections.value.length, ...counts }
+})
+const connectionsTrend = whileActive(() => connectionsHistory.value)
+const memoryValue = whileActive(() => (trafficLive.value && memory.value ? memory.value.inuse : null))
+const memoryTrend = whileActive(() => memoryHistory.value)
+const residentMemory = whileActive(() => {
+  const bytes = serviceStatus.value.memoryBytes
+  return rootMode.value && isRunning.value && typeof bytes === 'number' ? bytes : null
+})
+const cpu = whileActive(() => {
+  const percent = serviceStatus.value.cpuPercent
+  return rootMode.value && isRunning.value && typeof percent === 'number' ? percent : null
+})
+const cpuTrend = whileActive(() => cpuHistory.value)
+
+const topologyWaiting = computed(() => {
+  switch (link.value) {
+    case 'stopped':
+      return 'sing-box 运行后显示连接拓扑'
+    case 'connecting':
+      return '正在连接 sing-box…'
+    default:
+      return '与 sing-box 的连接已中断，恢复后显示连接拓扑'
+  }
+})
+
+onMounted(() => {
   startOverview()
   startConnections()
 })
 </script>
 
 <template>
-  <div class="space-y-4">
-    <h1 class="text-[26px] leading-tight tracking-tight font-bold">概览</h1>
+  <div class="overview-page">
+    <h1 class="text-[26px] leading-tight tracking-tight font-bold mb-3">概览</h1>
 
-    <div class="grid grid-cols-3 gap-3">
-      <div class="surface-card p-4 flex flex-col gap-1.5">
-        <div class="text-xs text-base-content/60 font-semibold tracking-wider">上传</div>
-        <div class="text-3xl font-extralight tabular-nums">
-          {{ formatSpeed(currentTraffic.up) }}
-        </div>
-        <div class="h-14 mt-1">
-          <SparkLine
-            :data="uploadSpeedHistory"
-            color="#0A84FF"
-            :min="60000"
-            :label-formatter="speedLabelFormatter"
-          />
-        </div>
-        <div class="text-xs text-base-content/50">总计 {{ formatBytes(uploadTotal) }}</div>
-      </div>
-      <div class="surface-card p-4 flex flex-col gap-1.5">
-        <div class="text-xs text-base-content/60 font-semibold tracking-wider">下载</div>
-        <div class="text-3xl font-extralight tabular-nums">
-          {{ formatSpeed(currentTraffic.down) }}
-        </div>
-        <div class="h-14 mt-1">
-          <SparkLine
-            :data="downloadSpeedHistory"
-            color="#BF5AF2"
-            :min="60000"
-            :label-formatter="speedLabelFormatter"
-          />
-        </div>
-        <div class="text-xs text-base-content/50">总计 {{ formatBytes(downloadTotal) }}</div>
-      </div>
-      <div class="surface-card p-4 flex flex-col gap-1.5">
-        <div class="text-xs text-base-content/60 font-semibold tracking-wider">
-          连接
-        </div>
-        <div class="text-3xl font-extralight tabular-nums">{{ connections.length }}</div>
-        <div class="h-14 mt-1">
-          <SparkLine
-            :data="connectionsHistory"
-            color="#30D158"
-            :min="10"
-            :label-formatter="connLabelFormatter"
-            :right-margin="24"
-          />
-        </div>
-        <div class="text-xs text-base-content/50">内存使用 {{ memoryUsage }}</div>
-      </div>
-    </div>
+    <OverviewHero
+      :link="link"
+      :service-state="serviceState"
+      :failures="linkFailures"
+      :traffic="traffic"
+      :totals="totals"
+      :down-history="downHistory"
+      :up-history="upHistory"
+    />
 
-    <NetworkInfo />
+    <OverviewStats
+      :connections="connectionStats"
+      :connections-history="connectionsTrend"
+      :memory="memoryValue"
+      :memory-history="memoryTrend"
+      :resident-memory="residentMemory"
+      :cpu="cpu"
+      :cpu-history="cpuTrend"
+      :show-cpu="rootMode"
+      :show-resident="rootMode"
+    />
 
-    <TopologyChart />
+    <NetworkInfo :running="isRunning" />
+
+    <TopologyChart :live="connectionsLive" :waiting="topologyWaiting" />
   </div>
 </template>
+
+<style scoped>
+.overview-page {
+  container-name: overview;
+  container-type: inline-size;
+  padding-bottom: 4px;
+}
+</style>

@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
-export type CoreAssetFormat = 'zip' | 'exe'
+export type CoreAssetFormat = 'zip' | 'exe' | 'tar.gz'
 
 export interface CoreUpdateInfo {
   version: string
@@ -25,32 +25,32 @@ export interface CoreUpdateProgress {
   total: number
 }
 
-export async function checkCoreUpdate(
-  repo: string,
-  channel: string,
-  assetFormat: CoreAssetFormat = 'zip',
-): Promise<CoreUpdateInfo> {
-  return invoke<CoreUpdateInfo>('check_core_update', { repo, channel, assetFormat })
+export async function checkCoreUpdate(repo: string, channel: string, githubToken: string, assetFormat?: CoreAssetFormat): Promise<CoreUpdateInfo> {
+  return invoke<CoreUpdateInfo>('check_core_update', { repo, channel, githubToken, assetFormat })
 }
 
-/** 下载并准备核心资产，返回 sing-box.exe 的 SHA-256（用于同版本一致性校验） */
-export async function probeAssetExeHash(args: {
+/** 下载资产并解压，返回其中 sing-box 核心的 SHA-256（用于同版本一致性校验） */
+export async function probeAssetCoreHash(args: {
   assetUrl: string
   assetSize: number
-  assetFormat: CoreAssetFormat
   assetDigest: string
+  assetFormat?: CoreAssetFormat
   mirror: string
 }): Promise<string> {
-  return invoke<string>('probe_asset_exe_hash', args)
+  return invoke<string>('probe_asset_core_hash', args)
 }
 
 export async function performCoreUpdate(args: {
   assetUrl: string
   assetSize: number
-  assetFormat: CoreAssetFormat
   assetDigest: string
+  assetFormat?: CoreAssetFormat
   mirror: string
   singboxPath: string
 }): Promise<CoreUpdateResult> {
   return invoke<CoreUpdateResult>('perform_core_update', args)
+}
+
+export async function openReleasePage(url: string): Promise<void> {
+  return invoke('open_release_page', { url })
 }

@@ -1,16 +1,26 @@
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
-use hickory_resolver::{Resolver, TokioResolver};
+use hickory_resolver::Resolver;
 use reqwest;
 use serde::Serialize;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use winreg::RegKey;
-use winreg::enums::*;
 
+#[cfg(not(windows))]
+const FALLBACK_DNS: [&str; 2] = ["223.5.5.5", "1.1.1.1"];
+
+#[cfg(not(windows))]
 fn get_system_proxy() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn get_system_proxy() -> Option<String> {
+    use winreg::RegKey;
+    use winreg::enums::*;
+
     let settings = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
         .ok()?;
@@ -60,11 +70,36 @@ pub(crate) fn build_client(timeout: Option<Duration>) -> Result<reqwest::Client,
     .build()
 }
 
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn describe_fetch_error(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    if error.is_timeout() {
+        "请求超时（30 秒）".into()
+    } else if error.is_builder() {
+        "地址无效".into()
+    } else if error.is_connect() {
+        "无法连接服务器，请检查网络；如果开着系统代理，确认它指向的程序在运行".into()
+    } else if error.is_decode() || error.is_body() {
+        "下载中断，内容不完整".into()
+    } else {
+        format!("下载失败：{error}")
+    }
+}
+
 #[tauri::command]
-pub async fn fetch_url(url: String) -> Result<String, String> {
-    let client = build_client(None).map_err(|e| e.to_string())?;
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
-    resp.text().await.map_err(|e| e.to_string())
+pub async fn fetch_url(url: String, user_agent: Option<String>) -> Result<String, String> {
+    let client = build_client(Some(FETCH_TIMEOUT)).map_err(|e| e.to_string())?;
+    let mut request = client.get(&url);
+    if let Some(agent) = user_agent.filter(|agent| !agent.trim().is_empty()) {
+        request = request.header(reqwest::header::USER_AGENT, agent);
+    }
+    let resp = request.send().await.map_err(describe_fetch_error)?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("服务器返回 HTTP {}", status.as_u16()));
+    }
+    resp.text().await.map_err(describe_fetch_error)
 }
 
 #[tauri::command]
@@ -137,6 +172,49 @@ fn parse_dns_server(server: &str) -> Result<(IpAddr, u16), String> {
     Err("DNS server must be an IP address".to_string())
 }
 
+fn name_server(ip: IpAddr, port: u16) -> NameServerConfig {
+    let mut udp = ConnectionConfig::udp();
+    udp.port = port;
+    let mut tcp = ConnectionConfig::tcp();
+    tcp.port = port;
+    NameServerConfig::new(ip, true, vec![udp, tcp])
+}
+
+#[cfg(windows)]
+fn system_resolver(_app: &tauri::AppHandle) -> Result<Resolver<TokioRuntimeProvider>, String> {
+    hickory_resolver::TokioResolver::builder_tokio()
+        .map_err(|e| e.to_string())?
+        .with_options(ResolverOpts::default())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn system_resolver(app: &tauri::AppHandle) -> Result<Resolver<TokioRuntimeProvider>, String> {
+    let reported = crate::native::dns_servers(app);
+    let servers: Vec<IpAddr> = reported
+        .iter()
+        .filter_map(|s| s.trim().trim_start_matches('/').parse().ok())
+        .collect();
+    let servers = if servers.is_empty() {
+        FALLBACK_DNS.iter().filter_map(|s| s.parse().ok()).collect()
+    } else {
+        servers
+    };
+    let name_servers = servers.into_iter().map(|ip| name_server(ip, 53)).collect();
+    custom_resolver(name_servers)
+}
+
+fn custom_resolver(
+    name_servers: Vec<NameServerConfig>,
+) -> Result<Resolver<TokioRuntimeProvider>, String> {
+    let config = ResolverConfig::from_parts(None, vec![], name_servers);
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(ResolverOpts::default())
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 fn display_dns_value(data: &hickory_resolver::proto::rr::RData) -> String {
     match data {
         hickory_resolver::proto::rr::RData::TXT(txt) => txt
@@ -151,6 +229,7 @@ fn display_dns_value(data: &hickory_resolver::proto::rr::RData) -> String {
 
 #[tauri::command]
 pub async fn dns_query(
+    app: tauri::AppHandle,
     domain: String,
     record_type: String,
     server: Option<String>,
@@ -172,22 +251,9 @@ pub async fn dns_query(
 
     let resolver = if let Some(server_text) = server.as_deref() {
         let (ip, port) = parse_dns_server(server_text)?;
-        let mut udp = ConnectionConfig::udp();
-        udp.port = port;
-        let mut tcp = ConnectionConfig::tcp();
-        tcp.port = port;
-        let name_server = NameServerConfig::new(ip, true, vec![udp, tcp]);
-        let config = ResolverConfig::from_parts(None, vec![], vec![name_server]);
-        Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .with_options(ResolverOpts::default())
-            .build()
-            .map_err(|e| e.to_string())?
+        custom_resolver(vec![name_server(ip, port)])?
     } else {
-        TokioResolver::builder_tokio()
-            .map_err(|e| e.to_string())?
-            .with_options(ResolverOpts::default())
-            .build()
-            .map_err(|e| e.to_string())?
+        system_resolver(&app)?
     };
 
     let lookup = resolver

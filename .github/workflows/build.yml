@@ -4,22 +4,48 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build (for example, v3.3.1)
+        description: Existing version tag to build (for example v4.9.3)
         required: true
         type: string
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  SINGBOARD_PANEL_UPDATE_REPO: ${{ github.repository }}
+
 jobs:
+  android-signing:
+    name: Check Android signing
+    runs-on: ubuntu-latest
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+    steps:
+      - name: Check signing secrets
+        id: check
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for name in ANDROID_KEYSTORE_B64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::warning::Missing secret $name; skipping Android APKs because release APKs must be signed with the same key to update in place"
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
   build-windows:
     name: Build Windows app
     runs-on: windows-latest
     env:
-      SINGBOARD_PANEL_UPDATE_REPO: ${{ github.repository }}
       WINDOWS_CERT_PFX_B64: ${{ secrets.WINDOWS_CERT_PFX_B64 }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
 
@@ -27,72 +53,59 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 24
-
-      - name: Install pnpm
-        run: npm install --global pnpm@11.20.0
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+          cache: pnpm
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Read release tag
-        shell: pwsh
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ inputs.tag }}
-          PUSH_TAG: ${{ github.ref_name }}
-        run: |
-          $tag = if ($env:EVENT_NAME -eq "workflow_dispatch") { $env:INPUT_TAG } else { $env:PUSH_TAG }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
-            throw "Invalid release tag: $tag"
-          }
-
-          $head = git rev-parse HEAD
-          $tagCommit = git rev-list -n 1 "refs/tags/$tag"
-          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $head) {
-            throw "Release tag $tag does not point to the checked-out commit"
-          }
-
-          "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
-          "APP_VERSION=$($tag -replace '^v', '')" >> $env:GITHUB_ENV
-
-      - name: Validate release version
+      - name: Build the desktop library as an rlib only
         shell: pwsh
         working-directory: src-tauri
         run: |
-          $metadataJson = cargo metadata --locked --no-deps --format-version 1
-          if ($LASTEXITCODE -ne 0) { throw "Unable to read Cargo metadata" }
-          $metadata = $metadataJson | ConvertFrom-Json
-          $package = @($metadata.packages | Where-Object { $_.name -eq "singboard" })
-          if ($package.Count -ne 1) {
-            throw "Expected exactly one singboard package in Cargo metadata"
-          }
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch '(?m)^crate-type = \[[^\]]*\]') { throw "crate-type not found in Cargo.toml" }
+          $manifest -replace '(?m)^crate-type = \[[^\]]*\]', 'crate-type = ["rlib"]' | Set-Content Cargo.toml -NoNewline
+          Select-String -Path Cargo.toml -Pattern '^crate-type'
 
-          $packageVersion = $package[0].version
-          if ($packageVersion -ne $env:APP_VERSION) {
-            throw "Release tag $env:RELEASE_TAG does not match package version $packageVersion"
-          }
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate release tag and package version
+        shell: pwsh
+        working-directory: src-tauri
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v[0-9]+[.][0-9]+[.][0-9]+$') { throw "Invalid version tag: $tag" }
+          $tagCommit = git rev-parse "$tag^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "Cannot resolve tag $tag" }
+          $headCommit = git rev-parse HEAD
+          if ($tagCommit -ne $headCommit) { throw "Tag $tag does not match HEAD" }
+          $metadataText = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          $metadata = $metadataText | ConvertFrom-Json
+          $packageVersion = ($metadata.packages | Where-Object { $_.name -eq 'singboard' }).version
+          $version = $tag -replace '^v', ''
+          if ($packageVersion -ne $version) { throw "Tag $tag does not match package version $packageVersion" }
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
 
       - name: Import code signing certificate
         if: env.WINDOWS_CERT_PFX_B64 != ''
@@ -138,8 +151,13 @@ jobs:
         run: |
           # The service host was signed before being embedded; fail loudly if
           # the Tauri build relinked it and wiped the signature.
-          & $env:SIGNTOOL verify /pa src-tauri/target/release/singboard.service
-          if ($LASTEXITCODE -ne 0) { throw "singboard.service lost its signature during the Tauri build" }
+          $serviceHost = Get-Item src-tauri/target/release/singboard-service.exe
+          & $env:SIGNTOOL verify /pa $serviceHost.FullName
+          if ($LASTEXITCODE -ne 0) { throw "singboard-service.exe lost its signature during the Tauri build" }
+          $hostHash = (Get-FileHash $serviceHost.FullName -Algorithm SHA256).Hash
+          $embedded = Get-ChildItem src-tauri/target/release/build -Recurse -File -Filter singboard.service |
+            Where-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash -eq $hostHash }
+          if (-not $embedded) { throw "no embedded singboard.service matches the signed singboard-service.exe" }
 
           $files = @(Get-Item src-tauri/target/release/singboard.exe)
           $files += Get-ChildItem src-tauri/target/release/bundle -Recurse -File -Include *.exe, *.msi -ErrorAction SilentlyContinue
@@ -150,12 +168,170 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "signature verification failed for $($f.Name)" }
           }
 
-      - name: Set build time
-        shell: pwsh
+      - name: Upload Windows app
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows
+          path: src-tauri/target/release/singboard.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  build-android:
+    name: Build Android ${{ matrix.abi }}
+    needs: android-signing
+    if: needs.android-signing.outputs.available == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64
+            rust-target: aarch64-linux-android
+            flavor: arm64
+          - abi: armeabi-v7a
+            target: armv7
+            rust-target: armv7-linux-androideabi
+            flavor: arm
+    env:
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate release tag
         run: |
-          $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Taipei Standard Time")
-          $now = [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $tz)
-          "DATE=$($now.ToString('yyyy-MM-dd HH:mm:ss')) UTC+8" >> $env:GITHUB_ENV
+          tag="$RELEASE_TAG"
+          [[ "$tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || { echo "Invalid release tag: $tag"; exit 1; }
+          test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)" || { echo "Tag does not match HEAD"; exit 1; }
+          echo "APP_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.3.0
+        with:
+          cache-provider: basic
+          add-job-summary: never
+
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Use preinstalled NDK r30
+        run: |
+          ndk=$(ls -d "$ANDROID_HOME"/ndk/30.* 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$ndk" ]; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370"
+            ndk="$ANDROID_HOME/ndk/30.0.16248370"
+          fi
+          test -f "$ndk/source.properties" || { echo "NDK r30 not found at $ndk"; exit 1; }
+          grep Pkg.Revision "$ndk/source.properties"
+          echo "NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.rust-target }}
+          env-vars: NDK_HOME
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Write signing config
+        working-directory: src-tauri/gen/android
+        run: |
+          echo "$ANDROID_KEYSTORE_B64" | base64 --decode > release.jks
+          {
+            echo "storeFile=release.jks"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: Build APK
+        run: |
+          chmod +x src-tauri/gen/android/gradlew
+          pnpm tauri android build --apk --split-per-abi --target ${{ matrix.target }} --config "{\"version\":\"$APP_VERSION\"}"
+
+      - name: Collect APK
+        run: |
+          mkdir -p release
+          cp "src-tauri/gen/android/app/build/outputs/apk/${{ matrix.flavor }}/release/app-${{ matrix.flavor }}-release.apk" "release/singboard-${{ matrix.abi }}.apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "release/singboard-${{ matrix.abi }}.apk"
+
+      - name: Remove signing material
+        if: always()
+        run: rm -f src-tauri/gen/android/release.jks src-tauri/gen/android/keystore.properties
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: apk-${{ matrix.abi }}
+          path: release/singboard-${{ matrix.abi }}.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release
+    needs: [build-windows, build-android]
+    if: always() && needs.build-windows.result == 'success' && (needs.build-android.result == 'success' || needs.build-android.result == 'skipped')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate release tag
+        run: |
+          tag="$RELEASE_TAG"
+          [[ "$tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || { echo "Invalid release tag: $tag"; exit 1; }
+          test "$(git rev-parse "$tag^{commit}")" = "$(git rev-parse HEAD)" || { echo "Tag does not match HEAD"; exit 1; }
+          echo "APP_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+      - name: Download build outputs
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Set build time
+        run: echo "DATE=$(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M:%S') UTC+8" >> "$GITHUB_ENV"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3.0.2
@@ -165,4 +341,5 @@ jobs:
           body: |
             Build time: ${{ env.DATE }}
           files: |
-            src-tauri/target/release/singboard.exe
+            release/singboard.exe
+            release/*.apk

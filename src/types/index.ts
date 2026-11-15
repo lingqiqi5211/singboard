@@ -55,6 +55,8 @@ export interface Connection {
   rulePayload: string
   downloadSpeed: number
   uploadSpeed: number
+  closedAt?: number
+  closedInBackground?: boolean
 }
 
 export interface ConnectionMetadata {
@@ -112,6 +114,8 @@ export interface ServiceStatus {
   state: 'running' | 'stopped' | 'starting' | 'stopping' | 'not_installed' | 'unknown'
   pid?: number
   uptimeSeconds?: number
+  cpuPercent?: number
+  memoryBytes?: number
 }
 
 export interface ProxyProvider {
@@ -149,12 +153,18 @@ export interface ClashApiProfile {
   secret: string
 }
 
+export type SaveCheck = 'passed' | 'failed' | 'skipped'
+
 export interface ConfigProfile {
   id: string
   name: string
   type: 'local' | 'remote'
   source: string
   lastUpdated?: string
+  lastFetchError?: string
+  lastFetchFailedAt?: string
+  lastLocalChangeAt?: string
+  backupUpdatedAt?: string
   autoUpdateInterval: number // 小时，0 = 不自动更新
 }
 
@@ -162,19 +172,27 @@ export interface AppConfig {
   clashApis: ClashApiProfile[]
   activeClashApiId: string
   singboxPath: string
+  coreInstallPath: string
+  configPath: string
+  rulesDir: string
   workingDir: string
   startupDelaySeconds: number
   theme: string
-  glassMode: 'clear' | 'blur'
+  glassTint: number
   latencyTestUrl: string
   ipv6TestEnabled: boolean
   groupTestUrls: Record<string, string>
   configProfiles: ConfigProfile[]
   activeConfigProfileId: string
   closeToTray: boolean
+  startPage: string
+  rootMode: boolean
+  setupCompleted: boolean
+  pageSwipe: boolean
   coreUpdateSource: 'official' | 'ref1nd' | 'lingqiqi' | 'custom'
   coreUpdateCustomRepo: string
   coreUpdateChannel: 'stable' | 'testing'
   coreUpdateMirror: string
   panelAutoCheckUpdate: boolean
+  githubToken: string
 }
